@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Find Your Flame 🔥 - Love Calculator</title>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&family=Pacifico&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- Floating Hearts Animation -->
+    <div class="hearts-container">
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+        <div class="heart"></div>
+    </div>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <h1 class="hero-title">Find Your Flame 🔥</h1>
+            <p class="hero-subtitle">Discover your love destiny with the classic FLAMES game</p>
+            <a href="#calculator" class="glow-button">Calculate Now</a>
+        </div>
+    </section>
+
+    <!-- FLAMES Calculator Section -->
+    <section id="calculator" class="calculator-section">
+        <div class="container">
+            <div class="calculator-card">
+                <h2 class="section-title">💕 FLAMES Calculator 💕</h2>
+                <p class="section-subtitle">Enter two names to find their relationship status</p>
+                
+                <form id="flamesForm" class="flames-form">
+                    <div class="input-group">
+                        <label for="name1">Your Name</label>
+                        <input 
+                            type="text" 
+                            id="name1" 
+                            name="name1" 
+                            placeholder="Enter your name" 
+                            required
+                            autocomplete="off"
+                        >
+                    </div>
+                    
+                    <div class="heart-divider">
+                        <span>❤️</span>
+                    </div>
+                    
+                    <div class="input-group">
+                        <label for="name2">Crush's Name</label>
+                        <input 
+                            type="text" 
+                            id="name2" 
+                            name="name2" 
+                            placeholder="Enter their name" 
+                            required
+                            autocomplete="off"
+                        >
+                    </div>
+                    
+                    <button type="submit" class="submit-button">
+                        Find Relationship 💘
+                    </button>
+                </form>
+                
+                <!-- Loading Animation -->
+                <div id="loading" class="loading hidden">
+                    <div class="beating-heart">❤️</div>
+                    <p>Calculating your destiny...</p>
+                </div>
+                
+                <!-- Result Display -->
+                <div id="result" class="result-container hidden">
+                    <div class="result-content">
+                        <h3 class="result-title">Your Relationship Status:</h3>
+                        <div class="result-badge">
+                            <span id="resultText"></span>
+                        </div>
+                        <p id="resultMessage" class="result-message"></p>
+                        <button id="tryAgain" class="try-again-button">Try Again 🔄</button>
+                    </div>
+                </div>
+                
+                <!-- Error Message -->
+                <div id="error" class="error-message hidden"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FLAMES Meaning Section -->
+    <section class="flames-meaning">
+        <div class="container">
+            <h2 class="section-title">What Does FLAMES Stand For?</h2>
+            <div class="flames-grid">
+                <div class="flames-card">
+                    <div class="flames-icon">🤝</div>
+                    <h3>F - Friends</h3>
+                    <p>A beautiful friendship bond</p>
+                </div>
+                <div class="flames-card">
+                    <div class="flames-icon">❤️</div>
+                    <h3>L - Lovers</h3>
+                    <p>Meant to be together</p>
+                </div>
+                <div class="flames-card">
+                    <div class="flames-icon">💕</div>
+                    <h3>A - Affection</h3>
+                    <p>Deep care and affection</p>
+                </div>
+                <div class="flames-card">
+                    <div class="flames-icon">💍</div>
+                    <h3>M - Marriage</h3>
+                    <p>Perfect for each other</p>
+                </div>
+                <div class="flames-card">
+                    <div class="flames-icon">⚡</div>
+                    <h3>E - Enemies</h3>
+                    <p>Opposites that clash</p>
+                </div>
+                <div class="flames-card">
+                    <div class="flames-icon">👫</div>
+                    <h3>S - Siblings</h3>
+                    <p>Family-like bond</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Romantic Quotes Section -->
+    <section class="quotes-section">
+        <div class="container">
+            <div class="quote-card">
+                <div class="quote-icon">💝</div>
+                <blockquote id="quote" class="quote-text">
+                    "Love is not about how many days, months, or years you have been together. Love is about how much you love each other every single day."
+                </blockquote>
+                <cite class="quote-author">- Anonymous</cite>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>Made with ❤️ using Python</p>
+            <p class="footer-subtitle">Find Your Flame © 2026</p>
+        </div>
+    </footer>
+
+    <!-- Custom JavaScript -->
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
