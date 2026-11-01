@@ -9,13 +9,19 @@ import {
   updateWeeklyReport,
   deleteWeeklyReport,
   getTaskReports,
-  createTaskReport
+  createTaskReport,
+  getHourlyReports,
+  submitHourlyReport
 } from "../controllers/reportController.js";
 import { authenticateToken } from "../middlewares/auth.js";
 
 const router = express.Router();
 
 router.use(authenticateToken);
+
+// Hourly Continuous Reporting
+router.get("/hourly", getHourlyReports);
+router.post("/hourly", submitHourlyReport);
 
 // Daily Reports
 router.get("/daily", getDailyReports);

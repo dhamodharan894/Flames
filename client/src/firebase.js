@@ -21,16 +21,18 @@ export const apiFetch = async (endpoint, options = {}) => {
 
   // Determine candidate URLs (prioritize local backend when developing locally)
   const candidateUrls = [];
-  if (import.meta.env.VITE_API_URL) {
-    const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
-    candidateUrls.push(`${envBase}${cleanEndpoint}`);
-  }
   if (isLocal) {
-    candidateUrls.push(`http://localhost:5001/api${cleanEndpoint}`);
-    candidateUrls.push(`${LOCAL_API_URL}${cleanEndpoint}`);
-    candidateUrls.push(`http://localhost:5000/api${cleanEndpoint}`);
     candidateUrls.push(`http://localhost:5005/api${cleanEndpoint}`);
+    candidateUrls.push(`http://127.0.0.1:5005/api${cleanEndpoint}`);
+    if (import.meta.env.VITE_API_URL && (import.meta.env.VITE_API_URL.includes("localhost") || import.meta.env.VITE_API_URL.includes("127.0.0.1"))) {
+      const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
+      candidateUrls.push(`${envBase}${cleanEndpoint}`);
+    }
   } else {
+    if (import.meta.env.VITE_API_URL) {
+      const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
+      candidateUrls.push(`${envBase}${cleanEndpoint}`);
+    }
     candidateUrls.push(`${PRODUCTION_API_URL}${cleanEndpoint}`);
     if (typeof window !== "undefined" && window.location.origin) {
       candidateUrls.push(`${window.location.origin}/api${cleanEndpoint}`);
@@ -128,7 +130,8 @@ export const loginUser = async (email, password, companySlug = "") => {
       mfaRequired: true,
       pendingToken: res.pendingToken,
       email: res.email || cleanEmail,
-      message: res.message
+      message: res.message,
+      devOtp: res.devOtp
     };
   }
 
@@ -947,49 +950,68 @@ export const subscribeToUserTasks = (userId, callback) => {
   let isMounted = true;
   let lastValidTasks = null;
 
-  // Immediate initialize from cached current user if matching
-  try {
-    const cached = JSON.parse(localStorage.getItem("att_current_user") || "null");
-    if (cached && (cached.uid === userId || cached.id === userId) && Array.isArray(cached.tasks) && cached.tasks.length > 0) {
-      lastValidTasks = cached.tasks;
-      callback(lastValidTasks);
-    }
-  } catch {}
-
   const fetchUserTasks = async () => {
     if (!userId) return;
     try {
       let tasks = null;
-      // 1. Direct user fetch
+      // 1. Direct tasks endpoint from PostgreSQL tasks table (primary)
       try {
-        const user = await apiFetch(`/users/${userId}`);
-        if (user && Array.isArray(user.tasks)) {
-          tasks = user.tasks;
-        }
-      } catch (err) {
-        // Direct route may 404 during rollouts
-      }
+        const directTasks = await apiFetch(`/tasks?assignedTo=${userId}`);
+        if (Array.isArray(directTasks)) {
+          const seen = new Set();
+          tasks = [];
+          for (const dbt of directTasks) {
+            const taskIdStr = String(dbt.id);
+            if (seen.has(taskIdStr)) continue;
+            seen.add(taskIdStr);
 
-      // 2. Direct tasks endpoint
-      if (tasks === null) {
-        try {
-          const directTasks = await apiFetch(`/tasks?assignedTo=${userId}`);
-          if (Array.isArray(directTasks) && directTasks.length > 0) {
-            tasks = directTasks.map(dbt => ({
-              id: String(dbt.id),
+            const meta = (dbt.metadata && typeof dbt.metadata === "object") ? dbt.metadata : {};
+            const durationHours = Number(dbt.duration) || (dbt.duration_minutes ? Number(dbt.duration_minutes) / 60 : 0);
+            let effectiveDeadline = dbt.deadline || meta.deadlineTimestamp || dbt.due_date;
+            if (!effectiveDeadline && durationHours > 0) {
+              const base = dbt.assigned_at || dbt.created_at || Date.now();
+              effectiveDeadline = new Date(new Date(base).getTime() + durationHours * 3600 * 1000).toISOString();
+            }
+            tasks.push({
+              ...dbt,
+              id: taskIdStr,
               title: dbt.title,
               description: dbt.description || "",
-              project: dbt.project_id || "",
+              project: dbt.project_name || dbt.projectName || dbt.project_id || "",
               completed: dbt.status === "completed" || dbt.status === "Completed",
-              status: dbt.status || "pending",
-              assignedAt: dbt.created_at,
-              assignedBy: dbt.created_by
-            }));
+              status: dbt.status || "new",
+              completionStatus: dbt.completion_status || "pending",
+              duration: durationHours,
+              durationMinutes: dbt.duration_minutes || (durationHours * 60),
+              deadline: effectiveDeadline,
+              startTime: dbt.start_time || meta.startTime,
+              assignedAt: dbt.assigned_at || dbt.created_at,
+              viewedAt: dbt.viewed_at,
+              acknowledgedAt: dbt.acknowledged_at,
+              slaPenaltyApplied: Boolean(dbt.sla_penalty_applied),
+              lastReportedAt: dbt.last_reported_at,
+              timerStartedAt: meta.timerStartedAt || null,
+              attendanceStatus: dbt.employee_attendance_status || "present",
+              isAttendanceLocked: Boolean(dbt.employee_is_admin_locked),
+              penaltyReason: dbt.employee_penalty_reason || null
+            });
+          }
+        }
+      } catch (err) {
+        // Fallback if network blip
+      }
+
+      // 2. Fallback to direct user embedded tasks
+      if (tasks === null || tasks.length === 0) {
+        try {
+          const user = await apiFetch(`/users/${userId}`);
+          if (user && Array.isArray(user.tasks) && user.tasks.length > 0) {
+            tasks = user.tasks;
           }
         } catch {}
       }
 
-      // 3. Cached current user fallback
+      // 3. Fallback to cached user
       if (tasks === null) {
         const cached = JSON.parse(localStorage.getItem("att_current_user") || "null");
         if (cached && (cached.uid === userId || cached.id === userId) && Array.isArray(cached.tasks) && cached.tasks.length > 0) {
@@ -1015,26 +1037,12 @@ export const subscribeToUserTasks = (userId, callback) => {
   };
   fetchUserTasks();
   const interval = setInterval(fetchUserTasks, 3000);
-
-  const handleLocalSync = () => {
-    fetchUserTasks();
-  };
-  try {
-    window.addEventListener("task-timer-changed", handleLocalSync);
-    window.addEventListener("task-status-changed", handleLocalSync);
-    window.addEventListener("task-sync", handleLocalSync);
-  } catch {}
-
   return () => {
     isMounted = false;
     clearInterval(interval);
-    try {
-      window.removeEventListener("task-timer-changed", handleLocalSync);
-      window.removeEventListener("task-status-changed", handleLocalSync);
-      window.removeEventListener("task-sync", handleLocalSync);
-    } catch {}
   };
 };
+
 
 export const subscribeToTaskReports = (arg, callback) => {
   let isMounted = true;
@@ -1073,7 +1081,7 @@ export const subscribeToTaskReports = (arg, callback) => {
     });
   };
   fetchReports();
-  const interval = setInterval(fetchReports, 4000);
+  const interval = setInterval(fetchReports, 30000);
   return () => {
     isMounted = false;
     clearInterval(interval);
@@ -2109,3 +2117,64 @@ export const reviewVerificationAttempt = async (attemptIdOrObj, decisionArg, not
 
 export const db = null;
 export default { apiFetch };
+
+
+// ============================================================================
+// TASK SLA & HOURLY REPORT COMPLIANCE CLIENT LAYER
+// ============================================================================
+
+export const markTaskViewed = async (taskId) => {
+  try {
+    return await apiFetch(`/tasks/${taskId}/view`, { method: "POST" });
+  } catch (e) {
+    console.warn("markTaskViewed error:", e.message);
+  }
+};
+
+export const completeTaskWithSla = async (taskId, completionNotes = "") => {
+  return await apiFetch(`/tasks/${taskId}/complete`, {
+    method: "POST",
+    body: JSON.stringify({ completionNotes })
+  });
+};
+
+export const submitHourlyReport = async (reportData) => {
+  return await apiFetch("/reports/hourly", {
+    method: "POST",
+    body: JSON.stringify(reportData)
+  });
+};
+
+export const getHourlyReports = async (params = {}) => {
+  const query = new URLSearchParams(params).toString();
+  return await apiFetch(`/reports/hourly${query ? `?${query}` : ""}`);
+};
+
+export const revertAttendancePenalty = async (attendanceId, resolutionNotes = "") => {
+  return await apiFetch(`/attendance/${attendanceId}/revert-penalty`, {
+    method: "POST",
+    body: JSON.stringify({ resolutionNotes })
+  });
+};
+
+export const assignTask = async (taskData) => {
+  return await apiFetch("/tasks", {
+    method: "POST",
+    body: JSON.stringify(taskData)
+  });
+};
+
+export const fetchAllTasks = async (params = {}) => {
+  const query = new URLSearchParams(params).toString();
+  const data = await apiFetch(`/tasks${query ? `?${query}` : ""}`);
+  if (Array.isArray(data)) {
+    const seen = new Set();
+    return data.filter(item => {
+      const id = String(item.id);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }
+  return data;
+};

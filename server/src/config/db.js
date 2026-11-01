@@ -15,11 +15,14 @@ const activeDbUrl = process.env.DATABASE_URL || DEFAULT_DB_URL;
 
 const pool = new Pool({
   connectionString: activeDbUrl,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
 });
 
 pool.on("connect", () => {
-  console.log("🐘 PostgreSQL client connected successfully.");
+  // connection established
 });
 
 pool.on("error", (err) => {

@@ -15,7 +15,8 @@ import {
   revokeFaceEnrollment,
   getVerificationAttempts,
   reviewVerificationAttempt,
-  createVerificationSession
+  createVerificationSession,
+  adminRevertPenalty
 } from "../controllers/attendanceController.js";
 import { authenticateToken, optionalAuth } from "../middlewares/auth.js";
 
@@ -34,6 +35,9 @@ router.post("/resume-work", endBreak);
 router.patch("/:id", updateAttendance);
 router.delete("/:id", deleteAttendance);
 router.post("/rules", updateAttendanceRules);
+
+// Compliance Penalty Resolution
+router.post("/:id/revert-penalty", adminRevertPenalty);
 
 // Biometric Face Enrollment & Management
 router.get("/face/status", getFaceStatus);

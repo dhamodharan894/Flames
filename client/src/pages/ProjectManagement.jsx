@@ -18,7 +18,8 @@ import {
   deleteWeeklyReport,
   updateUserTasks,
   updateUserProjects,
-  updateUserRecord
+  updateUserRecord,
+  assignTask
 } from "../firebase";
 import { useModal } from "../context/ModalContext";
 import { Search, Plus, Calendar, Clock, Edit2, Trash2, CheckCircle, XCircle, ChevronRight, UserPlus, Users, X, FileText, Download, MessageSquare, Briefcase, Sparkles, Zap, Eye, AlertCircle } from "lucide-react";
@@ -1322,22 +1323,35 @@ export default function ProjectManagement() {
 
     let currentTasks = [...(taskTargetUser.tasks || [])];
     
+    const durHours = Number(newTaskDuration) || 1;
+    const assignedTime = new Date().toISOString();
+    const calculatedDeadline = new Date(Date.now() + durHours * 3600 * 1000).toISOString();
+    
     if (editingTaskIndex !== null) {
+      const existing = currentTasks[editingTaskIndex];
+      const baseMs = existing?.assignedAt ? new Date(existing.assignedAt).getTime() : Date.now();
+      const updatedDeadline = new Date(baseMs + durHours * 3600 * 1000).toISOString();
       currentTasks[editingTaskIndex] = {
         ...currentTasks[editingTaskIndex],
         title: newTaskTitle,
-        duration: newTaskDuration,
+        duration: durHours,
+        durationMinutes: durHours * 60,
+        deadline: updatedDeadline,
+        dueDate: updatedDeadline,
         project: newTaskProject
       };
     } else {
       currentTasks.push({
         id: "task_" + Date.now(),
         title: newTaskTitle,
-        duration: newTaskDuration,
+        duration: durHours,
+        durationMinutes: durHours * 60,
+        deadline: calculatedDeadline,
+        dueDate: calculatedDeadline,
         project: newTaskProject,
         completed: false,
         assignedBy: currentUser.uid,
-        assignedAt: new Date().toISOString()
+        assignedAt: assignedTime
       });
     }
 
@@ -1345,12 +1359,24 @@ export default function ProjectManagement() {
       await updateUserTasks(taskTargetUser.uid, currentTasks);
       
       if (editingTaskIndex === null) {
+        await assignTask({
+          title: newTaskTitle.trim(),
+          assignedTo: taskTargetUser.uid,
+          projectId: newTaskProject || null,
+          deadline: calculatedDeadline,
+          dueDate: calculatedDeadline,
+          priority: "medium",
+          duration: durHours,
+          durationMinutes: durHours * 60,
+          companyId: currentUser.companyId
+        }).catch(err => console.warn("assignTask API fallback:", err));
+
         await createNotification(
           taskTargetUser.uid,
           "New Task Assigned",
           `You have been assigned a new task: "${newTaskTitle}" (${newTaskDuration}h) by ${currentUser.name}.`,
           "task",
-          "/dashboard?tab=tasks"
+          "/task-management"
         );
         showToast("Task assigned & user notified", "success");
       } else {

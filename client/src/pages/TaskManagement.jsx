@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useAuth } from "../context/AuthContext";
 import { useToast } from "../context/ToastContext";
@@ -14,37 +14,86 @@ import {
   subscribeToProjects,
   subscribeToUserTasks,
   updateUserTasks,
-  updateTaskStatus
+  updateTaskStatus,
+  markTaskViewed,
+  completeTaskWithSla,
+  submitHourlyReport,
+  getHourlyReports,
+  revertAttendancePenalty,
+  assignTask,
+  fetchAllTasks,
+  subscribeToAllUsers,
+  uploadFileToFirebase
 } from "../firebase";
-import { CheckCircle, Clock, Send, MessageSquare, Play, X, FileText, Download, Square, Activity, Plus, Trash2 } from "lucide-react";
+import { 
+  CheckCircle, Clock, Send, MessageSquare, Play, X, FileText, Download, 
+  Square, Activity, Plus, Trash2, AlertTriangle, AlertCircle, ShieldAlert, 
+  Check, RotateCcw, Calendar, User, TrendingUp, ListTodo, Eye, Unlock, Filter, Lock
+} from "lucide-react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
-import logoImg from '../assets/zuna-logo.png';
 import { addStandardPDFHeader, addPDFFooter } from "../utils/pdfHeader";
-import { uploadFileToFirebase } from "../firebase";
 import FileCard from "../components/FileCard";
+
 export default function TaskManagement() {
   const { currentUser } = useAuth();
   const { showToast } = useToast();
   
-  const [tasks, setTasks] = useState([]);
-  const [loading, setLoading] = useState(true);
-  
-  const [showReportModal, setShowReportModal] = useState(false);
-  const [showAllReportsModal, setShowAllReportsModal] = useState(false);
-  const [selectedTask, setSelectedTask] = useState(null);
-  const [reportText, setReportText] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [selectedDownloadProject, setSelectedDownloadProject] = useState("All");
+  const isAdmin = currentUser?.role === "admin" || currentUser?.role === "superadmin" || currentUser?.isSuperAdmin;
 
-  // Daily log states
-  const [activeSubTab, setActiveSubTab] = useState("tasks"); // "tasks" | "daily-logs"
+  // Active Tab state
+  // Admin default: "monitoring", Employee default: "my-tasks"
+  const [activeSubTab, setActiveSubTab] = useState(isAdmin ? "monitoring" : "my-tasks");
+
+  // Core Data States
+  const [tasks, setTasks] = useState([]);
+  const [adminAllTasks, setAdminAllTasks] = useState([]);
+  const [allCompanyUsers, setAllCompanyUsers] = useState([]);
+  const [allHourlyReports, setAllHourlyReports] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [now, setNow] = useState(Date.now());
+
+  // Modals
+  const [showAssignModal, setShowAssignModal] = useState(false);
+  const [showHourlyReportModal, setShowHourlyReportModal] = useState(false);
+  const [showTaskDetailsModal, setShowTaskDetailsModal] = useState(false);
+  const [showRevertModal, setShowRevertModal] = useState(false);
+  const [selectedTask, setSelectedTask] = useState(null);
+  const [selectedAttendanceRecord, setSelectedAttendanceRecord] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  // Filters
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  // Assign Task Form
+  const [assignTitle, setAssignTitle] = useState("");
+  const [assignDesc, setAssignDesc] = useState("");
+  const [assignEmployeeId, setAssignEmployeeId] = useState("");
+  const [assignProjectId, setAssignProjectId] = useState("");
+  const [assignPriority, setAssignPriority] = useState("medium");
+  const [assignStartTime, setAssignStartTime] = useState("");
+  const [assignDeadline, setAssignDeadline] = useState("");
+
+  // Hourly Progress Report Form
+  const [reportTaskId, setReportTaskId] = useState("");
+  const [reportWorkCompleted, setReportWorkCompleted] = useState("");
+  const [reportProgressPercent, setReportProgressPercent] = useState(50);
+  const [reportPendingWork, setReportPendingWork] = useState("");
+  const [reportIssuesBlockers, setReportIssuesBlockers] = useState("");
+
+  // Revert Penalty Form
+  const [revertNotes, setRevertNotes] = useState("");
+
+  // Daily Activity Log states (preserved existing functionality)
   const [dailyReports, setDailyReports] = useState([]);
   const [showAddLogModal, setShowAddLogModal] = useState(false);
   const [dailyLogPage, setDailyLogPage] = useState(1);
   const logsPerPage = 10;
-  
   const [logDate, setLogDate] = useState(new Date().toISOString().split("T")[0]);
   const [logHours, setLogHours] = useState(8);
   const [logTasksCompleted, setLogTasksCompleted] = useState("");
@@ -53,31 +102,49 @@ export default function TaskManagement() {
   const [pendingFile, setPendingFile] = useState(null);
   const [uploadingFile, setUploadingFile] = useState(false);
   const [logProjectIds, setLogProjectIds] = useState([]);
-  const [projects, setProjects] = useState([]);
+  const [selectedDownloadProject, setSelectedDownloadProject] = useState("All");
+  const [taskReports, setTaskReports] = useState({});
 
+  // Real-time ticking clock for countdowns
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  // Fetch Projects
   useEffect(() => {
     if (!currentUser?.companyId) return;
     const unsub = subscribeToProjects(currentUser.companyId, (data) => {
       setProjects(data || []);
     });
     return unsub;
-  }, [currentUser]);
+  }, [currentUser?.companyId]);
 
-  // For storing fetched reports per task ID
-  const [taskReports, setTaskReports] = useState({});
-  const [now, setNow] = useState(Date.now());
-
+  // Fetch Company Users for Admin Assignment
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!currentUser?.companyId || !isAdmin) return;
+    const unsub = subscribeToAllUsers(currentUser.companyId, (data) => {
+      const activeUsers = (data || []).filter(u => u.status !== "terminated" && u.role !== "superadmin");
+      setAllCompanyUsers(activeUsers);
+    });
+    return unsub;
+  }, [currentUser?.companyId, isAdmin]);
 
+  // Fetch Employee Tasks (for employee or admin my-tasks)
   useEffect(() => {
     if (!currentUser?.uid) return;
-    
     const unsubscribe = subscribeToUserTasks(currentUser.uid, (rawTasks) => {
-      // Auto-settle stale timers older than 12 hours
-      rawTasks.forEach(t => {
+      // Deduplicate tasks by unique ID
+      const seenTaskIds = new Set();
+      const uniqueTasks = [];
+      (rawTasks || []).forEach(t => {
+        const idKey = String(t.id);
+        if (!seenTaskIds.has(idKey)) {
+          seenTaskIds.add(idKey);
+          uniqueTasks.push(t);
+        }
+      });
+
+      uniqueTasks.forEach(t => {
         if (t.timerStartedAt) {
           const start = new Date(t.timerStartedAt).getTime();
           if (Date.now() - start > 12 * 3600 * 1000) {
@@ -85,37 +152,62 @@ export default function TaskManagement() {
           }
         }
       });
-      const sorted = [...rawTasks].reverse().sort((a, b) => {
+      const sorted = [...uniqueTasks].sort((a, b) => {
         const dateA = a.assignedAt ? new Date(a.assignedAt).getTime() : 0;
         const dateB = b.assignedAt ? new Date(b.assignedAt).getTime() : 0;
-        if (dateA && dateB) return dateB - dateA;
-        return 0;
+        return dateB - dateA;
       });
       setTasks(sorted);
       setLoading(false);
     });
-
     return unsubscribe;
-  }, [currentUser]);
+  }, [currentUser?.uid]);
 
-  // Subscribe to reports for all tasks
+  // Fetch Admin Company-Wide Tasks
+  const refreshAdminTasks = async () => {
+    if (!isAdmin || !currentUser?.companyId) return;
+    try {
+      const allTasks = await fetchAllTasks({ companyId: currentUser.companyId });
+      if (Array.isArray(allTasks)) {
+        setAdminAllTasks(allTasks);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch admin company tasks:", err.message);
+    }
+  };
+
   useEffect(() => {
-    if (!tasks.length) return;
-    
-    const unsubs = [];
-    tasks.forEach(t => {
-      const unsub = subscribeToTaskReports(t.id, (reports) => {
-        setTaskReports(prev => ({ ...prev, [t.id]: reports }));
-      });
-      unsubs.push(unsub);
-    });
-    
-    return () => {
-      unsubs.forEach(fn => fn());
-    };
-  }, [tasks.length]);
+    if (isAdmin) {
+      refreshAdminTasks();
+      const interval = setInterval(refreshAdminTasks, 10000);
+      return () => clearInterval(interval);
+    }
+  }, [isAdmin, currentUser?.companyId]);
 
-  // Subscribe to my daily reports
+  // Fetch Hourly Reports Stream
+  const refreshHourlyReports = async () => {
+    if (!currentUser?.companyId) return;
+    setReportsLoading(true);
+    try {
+      const params = isAdmin ? { companyId: currentUser.companyId } : { userId: currentUser.uid };
+      const reps = await getHourlyReports(params);
+      if (Array.isArray(reps)) {
+        setAllHourlyReports(reps);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch hourly reports:", err.message);
+    } finally {
+      setReportsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshHourlyReports();
+    const interval = setInterval(refreshHourlyReports, 15000);
+    return () => clearInterval(interval);
+  }, [currentUser?.companyId, currentUser?.uid, isAdmin]);
+
+  // Subscribe to Daily Activity Logs
   useEffect(() => {
     if (!currentUser?.uid) return;
     const unsubscribe = subscribeToMyDailyReports(currentUser.uid, (data) => {
@@ -124,1119 +216,1263 @@ export default function TaskManagement() {
     return unsubscribe;
   }, [currentUser?.uid]);
 
-  const getDayOfWeek = (dateString) => {
-    if (!dateString) return "";
-    const dateParts = dateString.split("-");
-    const date = new Date(Date.UTC(dateParts[0], dateParts[1] - 1, dateParts[2]));
-    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    return days[date.getUTCDay()];
-  };
+  // Auto-mark tasks as viewed when employee views the "my-tasks" tab
+  useEffect(() => {
+    if (activeSubTab === "my-tasks" && tasks.length > 0) {
+      tasks.forEach(t => {
+        if (!t.viewed_at && !t.viewedAt && t.id) {
+          markTaskViewed(t.id).catch(() => {});
+        }
+      });
+    }
+  }, [activeSubTab, tasks]);
 
-  const handleSaveDailyLog = async (e) => {
+  // ----------------------------------------------------
+  // COMPUTED METRICS FOR ADMIN MONITORING
+  // ----------------------------------------------------
+  const adminMetrics = useMemo(() => {
+    const total = adminAllTasks.length;
+    const completed = adminAllTasks.filter(t => t.status === "completed" || t.completed).length;
+    const inProgress = adminAllTasks.filter(t => t.status === "in-progress" || (t.status === "accepted" && !t.completed)).length;
+    
+    // Check for overdue tasks
+    const overdue = adminAllTasks.filter(t => {
+      if (t.status === "completed") return false;
+      const dl = t.deadline || t.metadata?.deadlineTimestamp || t.due_date;
+      if (!dl) return false;
+      return new Date(dl).getTime() < now;
+    }).length;
+
+    // Check for unviewed tasks exceeding 1 hour
+    const unviewedSlaBreach = adminAllTasks.filter(t => {
+      if (t.status === "completed" || t.viewed_at || t.viewedAt) return false;
+      const assigned = new Date(t.assigned_at || t.created_at).getTime();
+      return (now - assigned) > 60 * 60 * 1000;
+    }).length;
+
+    // Penalized employees count
+    const penalizedEmployees = adminAllTasks.filter(t => 
+      t.employee_attendance_status === "absent" && t.employee_is_admin_locked
+    ).length;
+
+    return {
+      total,
+      completed,
+      inProgress,
+      overdue,
+      unviewedSlaBreach,
+      penalizedEmployees
+    };
+  }, [adminAllTasks, now]);
+
+  // Filtered Admin Tasks
+  const filteredAdminTasks = useMemo(() => {
+    return adminAllTasks.filter(t => {
+      if (statusFilter !== "all") {
+        if (statusFilter === "completed" && !(t.status === "completed" || t.completed)) return false;
+        if (statusFilter === "in-progress" && t.status !== "in-progress") return false;
+        if (statusFilter === "new" && t.status !== "new" && t.status !== "pending") return false;
+        if (statusFilter === "overdue") {
+          const dl = t.deadline || t.metadata?.deadlineTimestamp || t.due_date;
+          if (!dl || new Date(dl).getTime() >= now || t.status === "completed") return false;
+        }
+        if (statusFilter === "penalized" && !(t.employee_attendance_status === "absent" && t.employee_is_admin_locked)) return false;
+      }
+      if (assigneeFilter !== "all" && t.assigned_to !== assigneeFilter) return false;
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        const titleMatch = (t.title || "").toLowerCase().includes(q);
+        const nameMatch = (t.assignee_name || t.assigneeName || "").toLowerCase().includes(q);
+        if (!titleMatch && !nameMatch) return false;
+      }
+      return true;
+    });
+  }, [adminAllTasks, statusFilter, assigneeFilter, searchQuery, now]);
+
+  // ----------------------------------------------------
+  // HANDLERS
+  // ----------------------------------------------------
+
+  // Admin: Assign New Task
+  const handleAssignTaskSubmit = async (e) => {
     e.preventDefault();
-    if (!logTasksCompleted.trim()) {
-      return showToast("Tasks Completed is required.", "warning");
-    }
-    if (logProjectIds.length === 0) {
-      return showToast("Please select at least one project.", "warning");
-    }
+    if (!assignTitle.trim()) return showToast("Task title is required.", "warning");
+    if (!assignEmployeeId) return showToast("Please select an assigned employee.", "warning");
+    if (!assignDeadline) return showToast("Task deadline is required.", "warning");
 
     setSubmitting(true);
-    let fileData = null;
     try {
-      if (pendingFile) {
-        setUploadingFile(true);
-        fileData = await uploadFileToFirebase(pendingFile, currentUser?.companyId || "", "Daily reports Attachments");
-        setUploadingFile(false);
+      const payload = {
+        title: assignTitle.trim(),
+        description: assignDesc.trim(),
+        assignedTo: assignEmployeeId,
+        projectId: assignProjectId || null,
+        priority: assignPriority,
+        startTime: assignStartTime || new Date().toISOString(),
+        deadline: new Date(assignDeadline).toISOString(),
+        dueDate: new Date(assignDeadline).toISOString(),
+        companyId: currentUser.companyId
+      };
+
+      await assignTask(payload);
+      showToast("Task assigned successfully! Notification dispatched to employee.", "success");
+      setShowAssignModal(false);
+      setAssignTitle("");
+      setAssignDesc("");
+      setAssignEmployeeId("");
+      setAssignProjectId("");
+      setAssignStartTime("");
+      setAssignDeadline("");
+      refreshAdminTasks();
+    } catch (err) {
+      console.error("Assign Task error:", err);
+      showToast(err.message || "Failed to assign task.", "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Employee: Submit Hourly Progress Report
+  const handleHourlyReportSubmit = async (e) => {
+    e.preventDefault();
+    const targetTaskId = reportTaskId || (selectedTask ? selectedTask.id : null) || (tasks.find(t => !t.completed)?.id);
+    if (!targetTaskId) {
+      return showToast("Please select a task to report on.", "warning");
+    }
+
+    const targetTask = tasks.find(t => t.id === targetTaskId);
+    if (targetTask && !isAdmin) {
+      const effDl = getEffectiveDeadline(targetTask);
+      if (effDl && new Date(effDl).getTime() < Date.now()) {
+        return showToast("Task deadline has finished. Progress reporting is locked for this task.", "warning");
       }
+    }
 
-      const selectedProjs = projects.filter(p => logProjectIds.includes(p.id));
-      const projectName = selectedProjs.map(p => p.name).join(", ");
+    if (!reportWorkCompleted.trim()) return showToast("Summary of work completed is required.", "warning");
+    if (!reportPendingWork.trim()) return showToast("Summary of pending work is required.", "warning");
 
-      const pmIdsToNotify = [...new Set(selectedProjs.map(p => p.managerId).filter(Boolean))];
-      const pocIdsToNotify = [...new Set(selectedProjs.map(p => p.pocId).filter(Boolean))];
-
-      await addDailyReport({
+    setSubmitting(true);
+    try {
+      const payload = {
+        taskId: targetTaskId,
+        workCompleted: reportWorkCompleted.trim(),
+        progressPercentage: Number(reportProgressPercent) || 0,
+        pendingWork: reportPendingWork.trim(),
+        issuesBlockers: reportIssuesBlockers.trim(),
+        summary: reportWorkCompleted.trim(),
+        challenges: reportIssuesBlockers.trim(),
+        nextHourPlan: reportPendingWork.trim(),
         userId: currentUser.uid,
-        userName: currentUser.name,
-        companyId: currentUser.companyId,
-        projectId: logProjectIds.join(","),
-        projectName,
-        pmId: pmIdsToNotify.join(","),
-        pocId: pocIdsToNotify.join(","),
-        date: logDate,
-        day: getDayOfWeek(logDate),
-        hours: Number(logHours),
-        tasksCompleted: logTasksCompleted,
-        issuesFaced: logIssuesFaced,
-        fileData: fileData || null,
-        status: logStatus
-      });
+        companyId: currentUser.companyId
+      };
 
-      const notifyMsg = `${currentUser.name} submitted a daily activity log for ${projectName} on ${logDate}.`;
-      
-      for (const pmId of pmIdsToNotify) {
-        await createNotification(pmId, "New Daily Activity Log", notifyMsg, "info", "/project-management");
-      }
-      
-      for (const pocId of pocIdsToNotify) {
-        if (!pmIdsToNotify.includes(pocId)) {
-          await createNotification(pocId, "New Daily Activity Log", notifyMsg, "info", "/project-management");
+      await submitHourlyReport(payload);
+
+      // Reset the 5-minute cycle to count fresh 5 minutes from now
+      const todayStr = new Date().toISOString().split("T")[0];
+      localStorage.setItem(`hourly_cycle_${targetTaskId}_${todayStr}`, Date.now().toString());
+
+      showToast("Progress report submitted successfully! Timer reset for 5 minutes.", "success");
+      setShowHourlyReportModal(false);
+      setReportWorkCompleted("");
+      setReportPendingWork("");
+      setReportIssuesBlockers("");
+      setReportProgressPercent(50);
+      refreshHourlyReports();
+    } catch (err) {
+      console.error("Submit Hourly Report error:", err);
+      const msg = err.message || "Failed to submit hourly report.";
+      showToast(msg, "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Admin: Revert Attendance Penalty
+  const handleRevertPenaltySubmit = async (e) => {
+    e.preventDefault();
+    if (!selectedAttendanceRecord) return;
+
+    setSubmitting(true);
+    try {
+      await revertAttendancePenalty(selectedAttendanceRecord.id, revertNotes);
+      showToast("Attendance penalty successfully reverted! Employee restored to Present.", "success");
+      setShowRevertModal(false);
+      setSelectedAttendanceRecord(null);
+      setRevertNotes("");
+      refreshAdminTasks();
+    } catch (err) {
+      console.error("Revert Penalty error:", err);
+      showToast(err.message || "Failed to revert attendance penalty.", "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Employee: Mark Task Complete with SLA Check
+  const handleMarkComplete = async (task, isComplete) => {
+    try {
+      if (!isAdmin) {
+        const effDl = getEffectiveDeadline(task);
+        if (effDl && new Date(effDl).getTime() < Date.now()) {
+          showToast("Task deadline has finished. Functionality is locked for this task.", "warning");
+          return;
         }
       }
 
-      showToast("Daily log submitted successfully!", "success");
-      setShowAddLogModal(false);
-      setLogDate(new Date().toISOString().split("T")[0]);
-      setLogHours(8);
-      setLogProjectIds([]);
-      setLogTasksCompleted("");
-      setLogIssuesFaced("");
-      setLogStatus("Completed");
-      setPendingFile(null);
-    } catch (err) {
-      console.error(err);
-      showToast("Failed to save daily log.", "error");
-      setUploadingFile(false);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleDeleteDailyLog = async (id) => {
-    try {
-      await deleteDailyReport(id);
-      showToast("Daily log deleted.", "success");
-    } catch (err) {
-      showToast("Failed to delete log.", "error");
-    }
-  };
-
-  const handleMarkComplete = async (taskIdx, isComplete) => {
-    let updatedTasks = [...tasks];
-    updatedTasks[taskIdx].completed = isComplete;
-    updatedTasks[taskIdx].status = isComplete ? "completed" : "pending";
-    setTasks(updatedTasks);
-
-    try {
-      const taskId = updatedTasks[taskIdx].id;
-      await updateTaskStatus(taskId, isComplete ? "completed" : "pending", currentUser.uid, updatedTasks);
-      showToast(isComplete ? "Task marked as completed!" : "Task marked as incomplete.", "success");
-      
-      // Notify PM if marked complete
-      if (isComplete && updatedTasks[taskIdx].assignedBy) {
-        await createNotification( 
-          updatedTasks[taskIdx].assignedBy,
-          "Task Completed",
-          `${currentUser.name} completed the task: "${updatedTasks[taskIdx].title}".`,
-          "success",
-          "/project-management"
-        );
-      }
-    } catch (err) {
-      showToast("Failed to update task", "error");
-    }
-  };
-
-  const handleOpenReportModal = (task) => {
-    setSelectedTask(task);
-    setReportText("");
-    setShowReportModal(true);
-  };
-
-  const handleSubmitReport = async (e) => {
-    e.preventDefault();
-    if (!reportText.trim()) return showToast("Report text is empty", "warning");
-
-    setSubmitting(true);
-    try {
-      await addTaskReport(selectedTask.id, currentUser.uid, selectedTask.assignedBy, reportText);
-      
-      const newReport = {
-        id: "rep_" + Date.now(),
-        taskId: selectedTask.id,
-        userId: currentUser.uid,
-        userName: currentUser.name || "You",
-        reportText: reportText,
-        content: reportText,
-        timeSpentMinutes: 0,
-        createdAt: new Date().toISOString(),
-        submittedAt: new Date().toISOString(),
-        timestamp: new Date().toISOString()
-      };
-      setTaskReports(prev => ({
-        ...prev,
-        [selectedTask.id]: [newReport, ...(prev[selectedTask.id] || [])]
-      }));
-
-      if (selectedTask.assignedBy) {
-        await createNotification(
-          selectedTask.assignedBy,
-          "New Task Update",
-          `${currentUser.name} submitted an hourly update for "${selectedTask.title}".`,
-          "info",
-          "/project-management"
-        );
-      }
-      
-      showToast("Hourly report submitted successfully!", "success");
-      setShowReportModal(false);
-      setSelectedTask(null);
-      setReportText("");
-    } catch (err) {
-      showToast("Failed to submit report", "error");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const activeTasks = tasks.filter(t => !t.completed);
-  const completedTasks = tasks.filter(t => t.completed);
-
-  const calculateTimeSpent = (reports) => {
-    if (!reports || reports.length === 0) return 0;
-    let totalMinutes = 0;
-    reports.forEach(r => {
-      const matchH = r.reportText.match(/(\d+)\s*h/i);
-      const matchM = r.reportText.match(/(\d+)\s*m/i);
-      if (matchH) totalMinutes += parseInt(matchH[1], 10) * 60;
-      if (matchM) totalMinutes += parseInt(matchM[1], 10);
-    });
-    return totalMinutes / 60; // returns hours
-  };
-
-  const handleDownloadPDF = async () => {
-    const doc = new jsPDF();
-    const titleText = selectedDownloadProject === "All" ? "My Task Reports" : `Task Report: ${selectedDownloadProject}`;
-    const subtitleText = `Employee: ${currentUser.name} | Downloaded: ${new Date().toLocaleString()}`;
-    const startY = await addStandardPDFHeader(doc, titleText, subtitleText);
-    
-    const tableData = [];
-    const tasksToExport = selectedDownloadProject === "All" ? tasks : tasks.filter(t => t.project === selectedDownloadProject);
-    
-    tasksToExport.forEach(t => {
-      const status = t.completed ? "Done" : "Active";
-      tableData.push([{ content: t.title, styles: { fontStyle: 'bold', fillColor: [243, 244, 246] } }, { content: status, styles: { fillColor: [243, 244, 246] } }, { content: `${t.duration || 0}h`, styles: { fillColor: [243, 244, 246] } }]);
-      
-      const reports = [...(taskReports[t.id] || [])].sort((a, b) => new Date(a.timestamp || a.createdAt || a.submittedAt) - new Date(b.timestamp || b.createdAt || b.submittedAt));
-      if (reports.length > 0) {
-        reports.forEach(r => {
-          const reportDate = r.timestamp || r.createdAt || r.submittedAt;
-          tableData.push([
-            { content: `Update: ${r.reportText}`, colSpan: 2, styles: { textColor: [60, 60, 60], cellPadding: { left: 14, top: 6, bottom: 6, right: 8 } } },
-            { content: reportDate ? new Date(reportDate).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : "—", styles: { fontSize: 8, textColor: [120, 120, 120], cellPadding: { left: 8, top: 6, bottom: 6, right: 8 }, halign: 'right' } }
-          ]);
-        });
+      if (isComplete) {
+        const res = await completeTaskWithSla(task.id);
+        const statusMsg = res.completion_status === "completed_on_time" 
+          ? "Task completed on time! Excellent job." 
+          : "Task marked completed (overdue SLA recorded).";
+        showToast(statusMsg, res.completion_status === "completed_on_time" ? "success" : "info");
       } else {
-        tableData.push([
-          { content: "No updates reported yet", colSpan: 3, styles: { fontStyle: 'italic', textColor: [150, 150, 150], cellPadding: { left: 14, top: 6, bottom: 6, right: 8 } } }
-        ]);
+        await updateTaskStatus(task.id, "pending", currentUser.uid);
+        showToast("Task marked as in progress.", "info");
       }
-    });
-
-    if (tableData.length === 0) {
-      showToast("No data to export", "warning");
-      return;
+    } catch (err) {
+      console.error("Complete Task error:", err);
+      showToast("Failed to update task status.", "error");
     }
-
-    autoTable(doc, {
-      head: [["Task Details", "Status", "Duration"]],
-      body: tableData,
-      startY: startY,
-      styles: { fontSize: 9, font: "helvetica", cellPadding: { top: 6, bottom: 6, left: 4, right: 4 }, lineColor: [226, 232, 240], lineWidth: 0.1 },
-      headStyles: { fillColor: [79, 70, 229], textColor: [255, 255, 255], fontStyle: "bold", fontSize: 10, cellPadding: { top: 8, bottom: 8, left: 4, right: 4 } },
-      columnStyles: { 0: { cellWidth: 105, halign: 'left' }, 1: { halign: 'center', cellWidth: 25 }, 2: { halign: 'right', cellWidth: 52 } },
-      theme: 'grid',
-      alternateRowStyles: { fillColor: [248, 250, 252] }
-    });
-    
-    addPDFFooter(doc);
-    const fileNameSuffix = selectedDownloadProject === "All" ? "My_Reports" : `Project_${selectedDownloadProject.replace(/\s+/g, '_')}`;
-    doc.save(`${fileNameSuffix}_${new Date().toISOString().split('T')[0]}.pdf`);
-    showToast("Task reports PDF exported!", "success");
   };
 
-  const handleDownloadExcel = () => {
-    const tableData = [];
-    const tasksToExport = selectedDownloadProject === "All" ? tasks : tasks.filter(t => t.project === selectedDownloadProject);
-    tasksToExport.forEach(t => {
-      const status = t.completed ? "Done" : "Active";
-      tableData.push({
-        "Employee": currentUser.name,
-        "Task Title": t.title,
-        "Status": status,
-        "Est. Hours": t.duration || 0,
-        "Update Detail": "--- Task Summary ---",
-        "Update Timestamp": ""
-      });
-      
-      const reports = [...(taskReports[t.id] || [])].sort((a, b) => new Date(a.timestamp || a.createdAt || a.submittedAt) - new Date(b.timestamp || b.createdAt || b.submittedAt));
-      if (reports.length > 0) {
-        reports.forEach(r => {
-          const reportDate = r.timestamp || r.createdAt || r.submittedAt;
-          tableData.push({
-            "Employee": "",
-            "Task Title": "",
-            "Status": "",
-            "Est. Hours": "",
-            "Update Detail": r.reportText,
-            "Update Timestamp": reportDate ? new Date(reportDate).toLocaleString() : ""
-          });
-        });
-      } else {
-        tableData.push({
-          "Employee": "",
-          "Task Title": "",
-          "Status": "",
-          "Est. Hours": "",
-          "Update Detail": "No updates reported yet",
-          "Update Timestamp": ""
-        });
+  // Helper: Compute effective deadline from explicit deadline, due date, or estimated duration
+  const getEffectiveDeadline = (task) => {
+    if (!task) return null;
+    if (task.deadline) return task.deadline;
+    if (task.dueDate || task.due_date) return task.dueDate || task.due_date;
+    const durHours = Number(task.duration) || (task.duration_minutes ? Number(task.duration_minutes) / 60 : 0) || (task.durationMinutes ? Number(task.durationMinutes) / 60 : 0);
+    if (durHours > 0) {
+      const base = task.assignedAt || task.assigned_at || task.start_time || task.startTime || task.created_at || (task.id && !isNaN(Number(String(task.id).replace("task_", ""))) ? Number(String(task.id).replace("task_", "")) : null);
+      const baseMs = base ? new Date(base).getTime() : Date.now();
+      if (!isNaN(baseMs)) {
+        return new Date(baseMs + durHours * 3600 * 1000).toISOString();
       }
-    });
+    }
+    return null;
+  };
 
-    if (tableData.length === 0) {
-      showToast("No data to export", "warning");
-      return;
+  // Helper: Format countdown remaining
+  const formatCountdown = (deadlineStr) => {
+    if (!deadlineStr) return null;
+    const dl = new Date(deadlineStr).getTime();
+    if (isNaN(dl)) return null;
+
+    const diff = dl - now;
+    if (diff <= 0) {
+      const overdueMins = Math.floor(Math.abs(diff) / 60000);
+      const overdueHrs = Math.floor(overdueMins / 60);
+      if (overdueHrs > 0) {
+        return { isOverdue: true, text: `Overdue by ${overdueHrs}h ${overdueMins % 60}m` };
+      }
+      return { isOverdue: true, text: `Overdue by ${overdueMins}m` };
     }
 
-    const ws = XLSX.utils.json_to_sheet(tableData);
-    const wb = XLSX.utils.book_new();
-    const sheetName = selectedDownloadProject === "All" ? "My Reports" : selectedDownloadProject.substring(0, 31);
-    XLSX.utils.book_append_sheet(wb, ws, sheetName);
-    const fileNameSuffix = selectedDownloadProject === "All" ? "My_Reports" : `Project_${selectedDownloadProject.replace(/\s+/g, '_')}`;
-    XLSX.writeFile(wb, `${fileNameSuffix}_${new Date().toISOString().split('T')[0]}.xlsx`);
+    const totalSeconds = Math.floor(diff / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    return {
+      isOverdue: false,
+      text: `${hours > 0 ? `${hours}h ` : ""}${minutes}m ${seconds}s remaining`
+    };
   };
 
-  const handleDownloadSingleTaskPDF = async (task) => {
-    const doc = new jsPDF();
-    const titleText = `Task Report: ${task.title}`;
-    const subtitleText = `Employee: ${currentUser.name} | Downloaded: ${new Date().toLocaleString()}`;
-    let startY = await addStandardPDFHeader(doc, titleText, subtitleText);
-    
-    const tableData = [];
-    const status = task.completed ? "Done" : "Active";
-    tableData.push([{ content: task.title, styles: { fontStyle: 'bold', fillColor: [243, 244, 246] } }, { content: status, styles: { fillColor: [243, 244, 246] } }, { content: `${task.duration || 0}h`, styles: { fillColor: [243, 244, 246] } }]);
-    
-    const reports = [...(taskReports[task.id] || [])].sort((a, b) => new Date(a.timestamp || a.createdAt || a.submittedAt) - new Date(b.timestamp || b.createdAt || b.submittedAt));
-    if (reports.length > 0) {
-      reports.forEach(r => {
-        const reportDate = r.timestamp || r.createdAt || r.submittedAt;
-        tableData.push([
-          { content: `Update: ${r.reportText}`, colSpan: 2, styles: { textColor: [60, 60, 60], cellPadding: { left: 14, top: 6, bottom: 6, right: 8 } } },
-          { content: reportDate ? new Date(reportDate).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : "—", styles: { fontSize: 8, textColor: [120, 120, 120], cellPadding: { left: 8, top: 6, bottom: 6, right: 8 }, halign: 'right' } }
-        ]);
-      });
-    } else {
-      tableData.push([
-        { content: "No updates reported yet", colSpan: 3, styles: { fontStyle: 'italic', textColor: [150, 150, 150], cellPadding: { left: 14, top: 6, bottom: 6, right: 8 } } }
-      ]);
+  // Helper: Format next progress report countdown (Enforces 5-minute cycle, 10-minute absence penalty)
+  const getNextReportDue = (task) => {
+    if (!task) return null;
+    const todayStr = new Date().toISOString().split("T")[0];
+    const sessionKey = `hourly_cycle_${task.id}_${todayStr}`;
+    let baseTime = null;
+
+    // 1. If a report was submitted today for this task, count 5 mins from that report:
+    const lastReport = task.lastReportedAt || task.last_reported_at;
+    if (lastReport) {
+      const repTime = new Date(lastReport).getTime();
+      const isToday = new Date().toDateString() === new Date(repTime).toDateString();
+      if (isToday) {
+        baseTime = repTime;
+      }
     }
 
-    autoTable(doc, {
-      head: [["Task Details", "Status", "Duration"]],
-      body: tableData,
-      startY: startY,
-      styles: { fontSize: 9, font: "helvetica", cellPadding: { top: 6, bottom: 6, left: 4, right: 4 }, lineColor: [226, 232, 240], lineWidth: 0.1 },
-      headStyles: { fillColor: [79, 70, 229], textColor: [255, 255, 255], fontStyle: "bold", fontSize: 10, cellPadding: { top: 8, bottom: 8, left: 4, right: 4 } },
-      columnStyles: { 0: { cellWidth: 105, halign: 'left' }, 1: { halign: 'center', cellWidth: 25 }, 2: { halign: 'right', cellWidth: 52 } },
-      theme: 'grid',
-      alternateRowStyles: { fillColor: [248, 250, 252] }
-    });
-    
-    addPDFFooter(doc);
-    doc.save(`Task_Report_${task.title.replace(/\s+/g, '_').substring(0,10)}_${new Date().toISOString().split('T')[0]}.pdf`);
-    showToast("Task report PDF exported!", "success");
-  };
+    // 2. If task was updated / extended by admin, baseline from extension time
+    const extensionTime = (task.updatedAt || task.updated_at) ? new Date(task.updatedAt || task.updated_at).getTime() : 0;
+    if (extensionTime && (!baseTime || extensionTime > baseTime)) {
+      baseTime = extensionTime;
+      try { localStorage.setItem(sessionKey, extensionTime.toString()); } catch(e) {}
+    }
 
-  const handleDownloadDailyLogPDF = async () => {
-    if (dailyReports.length === 0) return showToast("No daily logs to download.", "warning");
-    
-    const doc = new jsPDF();
-    const titleText = "Daily Activity Log Report";
-    const subtitleText = `Employee: ${currentUser.name} | Generated: ${new Date().toLocaleDateString()}`;
-    const startY = await addStandardPDFHeader(doc, titleText, subtitleText);
+    // 3. Fallback to session key stored time
+    if (!baseTime) {
+      let stored = localStorage.getItem(sessionKey);
+      if (!stored) {
+        stored = Date.now().toString();
+        try { localStorage.setItem(sessionKey, stored); } catch(e) {}
+      }
+      baseTime = parseInt(stored, 10);
+    }
 
-    const tableData = dailyReports.map((report) => [
-      report.date,
-      report.hours + "h",
-      report.tasksCompleted || "-",
-      report.issuesFaced || "-",
-      report.status || "Completed"
-    ]);
+    // 4. If deadline is active (in the future) and attendance is not locked,
+    // ensure stale overdue local timers from before the extension are refreshed
+    const effectiveDl = getEffectiveDeadline(task);
+    const isFutureDeadline = effectiveDl && new Date(effectiveDl).getTime() > now;
+    if (isFutureDeadline && !task.isAttendanceLocked && task.attendanceStatus !== "absent") {
+      const totalElapsed = (now - baseTime) / 60000;
+      if (totalElapsed >= 10 && !lastReport) {
+        // Stale timer from earlier before extension: reset fresh to now
+        baseTime = now;
+        try { localStorage.setItem(sessionKey, now.toString()); } catch(e) {}
+      }
+    }
 
-    autoTable(doc, {
-      head: [["Date", "Hours", "Tasks Completed", "Issues Faced", "Status"]],
-      body: tableData,
-      startY: startY + 5,
-      styles: { fontSize: 9, font: "helvetica", cellPadding: 6, lineColor: [226, 232, 240], lineWidth: 0.1 },
-      headStyles: { fillColor: [79, 70, 229], textColor: [255, 255, 255], fontStyle: "bold" },
-      columnStyles: { 0: { halign: 'center' }, 1: { halign: 'center' }, 4: { halign: 'center' } },
-      theme: 'grid',
-      alternateRowStyles: { fillColor: [248, 250, 252] }
-    });
+    const nextDue = baseTime + 5 * 60 * 1000; // 5 minutes cycle
+    const diff = nextDue - now;
 
-    addPDFFooter(doc);
-    doc.save(`Daily_Activity_Log_${currentUser.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.pdf`);
-    showToast("Daily activity log PDF exported successfully.", "success");
-  };
+    if (diff <= 0) {
+      const overdueMins = Math.floor(Math.abs(diff) / 60000);
+      const totalElapsedMins = Math.floor((now - baseTime) / 60000);
+      if (totalElapsedMins >= 10 && task.isAttendanceLocked) {
+        return { isOverdue: true, text: "Report overdue (> 10m - Absent Penalty)" };
+      }
+      return { isOverdue: true, text: `Report overdue by ${overdueMins}m` };
+    }
 
-  const handleDownloadDailyLogExcel = () => {
-    if (dailyReports.length === 0) return showToast("No daily logs to download.", "warning");
-    
-    const excelData = dailyReports.map((report) => ({
-      "Date": report.date,
-      "Hours": report.hours,
-      "Tasks Completed": report.tasksCompleted || "-",
-      "Issues Faced": report.issuesFaced || "-",
-      "Supervisor Remarks": report.supervisorRemarks || "-",
-      "Status": report.status || "Completed"
-    }));
-
-    const worksheet = XLSX.utils.json_to_sheet(excelData);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Daily Log");
-    XLSX.writeFile(workbook, `Daily_Activity_Log_${currentUser.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.xlsx`);
-    showToast("Excel spreadsheet generated successfully.", "success");
+    const mins = Math.floor(diff / 60000);
+    const secs = Math.floor((diff % 60000) / 1000);
+    return { isOverdue: false, text: `Next report in ${mins}m ${secs}s` };
   };
 
   return (
-    <div className="animate-fade-in pb-10">
+    <div className="animate-fade-in pb-12">
+      {/* Page Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
         <div>
-          <h1 className="text-2xl font-black text-text-main tracking-tight">Task & Activity Management</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-black text-text-main tracking-tight">Task & Activity Management</h1>
+            <span className={`px-2.5 py-0.5 text-[11px] font-bold uppercase rounded-full ${
+              isAdmin ? "bg-purple-500/10 text-purple-600 border border-purple-500/20" : "bg-blue-500/10 text-blue-600 border border-blue-500/20"
+            }`}>
+              {isAdmin ? "Admin Workspace" : "Employee Portal"}
+            </span>
+          </div>
           <p className="text-sm text-text-mut font-medium mt-1">
-            Your current projects: <span className="font-bold text-brand-primary">{(currentUser.projects && currentUser.projects.length > 0) ? currentUser.projects.join(', ') : (currentUser.project || "Unassigned")}</span>
+            Real-time task SLA assignment, 1-hour view compliance, and continuous hourly progress reporting.
           </p>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex items-center gap-3">
+          {isAdmin && (
+            <button
+              onClick={() => setShowAssignModal(true)}
+              className="flex items-center gap-2 bg-brand-primary text-white hover:bg-brand-primary/90 px-4 py-2.5 rounded-[12px] font-bold text-xs shadow-sm transition-all cursor-pointer"
+            >
+              <Plus size={16} />
+              Assign New Task
+            </button>
+          )}
+
+          {!isAdmin && (
+            <button
+              onClick={() => {
+                const availableTasks = tasks.filter(t => {
+                  if (t.completed) return false;
+                  const dl = getEffectiveDeadline(t);
+                  return !(dl && new Date(dl).getTime() < Date.now());
+                });
+                if (availableTasks.length === 0) {
+                  showToast("Task deadline has finished. Functionality is locked because no active tasks are within deadline.", "warning");
+                  return;
+                }
+                const active = availableTasks[0];
+                setSelectedTask(active || null);
+                setReportTaskId(active ? active.id : "");
+                setShowHourlyReportModal(true);
+              }}
+              className="flex items-center gap-2 bg-brand-primary text-white hover:bg-brand-primary/90 px-4 py-2.5 rounded-[12px] font-bold text-xs shadow-sm transition-all cursor-pointer"
+            >
+              <Send size={15} />
+              Submit Hourly Report
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="flex border-b border-border-card mb-6">
+      {/* Tabs Navigation */}
+      <div className="flex border-b border-border-card mb-6 overflow-x-auto custom-scrollbar">
+        {isAdmin && (
+          <button
+            onClick={() => setActiveSubTab("monitoring")}
+            className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap ${
+              activeSubTab === "monitoring"
+                ? "border-brand-primary text-brand-primary"
+                : "border-transparent text-text-mut hover:text-text-main"
+            }`}
+          >
+            <Activity size={16} />
+            Task Monitoring & SLA
+          </button>
+        )}
+
         <button
-          onClick={() => setActiveSubTab("tasks")}
-          className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer ${
-            activeSubTab === "tasks"
+          onClick={() => setActiveSubTab("my-tasks")}
+          className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap ${
+            activeSubTab === "my-tasks"
               ? "border-brand-primary text-brand-primary"
               : "border-transparent text-text-mut hover:text-text-main"
           }`}
         >
-          My Tasks
+          <ListTodo size={16} />
+          {isAdmin ? "My Personal Tasks" : "My Assigned Tasks"}
+          {tasks.filter(t => !t.completed).length > 0 && (
+            <span className="bg-brand-primary/10 text-brand-primary px-2 py-0.5 rounded-full text-xs font-black">
+              {tasks.filter(t => !t.completed).length}
+            </span>
+          )}
         </button>
+
+        <button
+          onClick={() => setActiveSubTab("hourly-reports")}
+          className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap ${
+            activeSubTab === "hourly-reports"
+              ? "border-brand-primary text-brand-primary"
+              : "border-transparent text-text-mut hover:text-text-main"
+          }`}
+        >
+          <TrendingUp size={16} />
+          Hourly Progress Reports
+          {allHourlyReports.length > 0 && (
+            <span className="bg-emerald-500/10 text-emerald-600 px-2 py-0.5 rounded-full text-xs font-black">
+              {allHourlyReports.length}
+            </span>
+          )}
+        </button>
+
         <button
           onClick={() => setActiveSubTab("daily-logs")}
-          className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer ${
+          className={`pb-3 px-6 text-sm font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap ${
             activeSubTab === "daily-logs"
               ? "border-brand-primary text-brand-primary"
               : "border-transparent text-text-mut hover:text-text-main"
           }`}
         >
+          <Calendar size={16} />
           Daily Activity Log
         </button>
       </div>
 
-      {activeSubTab === "tasks" ? (
-        <>
-          {loading ? (
-            <div className="flex justify-center p-10"><span className="text-text-mut">Loading tasks...</span></div>
-          ) : tasks.length === 0 ? (
-            <div className="bg-bg-card border border-border-card rounded-[20px] p-10 text-center flex flex-col items-center">
-              <div className="w-16 h-16 bg-brand-primary/10 rounded-full flex items-center justify-center mb-4">
-                <CheckCircle size={32} className="text-brand-primary" />
-              </div>
-              <h3 className="text-lg font-bold text-text-main">No Tasks Assigned</h3>
-              <p className="text-xs text-text-sec max-w-sm mt-2">
-                You currently have no tasks assigned to you for this project. Check back later or contact your Project Manager.
+      {/* ==================================================================== */}
+      {/* 1. ADMIN TASK MONITORING & SLA SECTION */}
+      {/* ==================================================================== */}
+      {activeSubTab === "monitoring" && isAdmin && (
+        <div className="space-y-6">
+          {/* KPI Cards Grid */}
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">Total Tasks</span>
+              <p className="text-2xl font-black text-text-main mt-1">{adminMetrics.total}</p>
+            </div>
+
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">In Progress</span>
+              <p className="text-2xl font-black text-blue-500 mt-1">{adminMetrics.inProgress}</p>
+            </div>
+
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">Completed</span>
+              <p className="text-2xl font-black text-emerald-500 mt-1">{adminMetrics.completed}</p>
+            </div>
+
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">Overdue Tasks</span>
+              <p className={`text-2xl font-black mt-1 ${adminMetrics.overdue > 0 ? "text-amber-500" : "text-text-main"}`}>
+                {adminMetrics.overdue}
               </p>
             </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Active Tasks Column */}
-              <div className="space-y-4">
-                <h2 className="font-extrabold text-sm text-text-main uppercase tracking-wider flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-brand-warning animate-pulse"></span>
-                  Active Tasks ({activeTasks.length})
-                </h2>
-                
-                {activeTasks.length === 0 ? (
-                  <div className="p-6 border border-dashed border-border-card rounded-[16px] text-center text-text-mut text-xs">
-                    No active tasks.
-                  </div>
-                ) : (
-                  <div className="space-y-4 max-h-[600px] overflow-y-auto custom-scrollbar pr-2 pb-2">
-                    {activeTasks.map((task) => {
-                      const taskIdx = tasks.findIndex(t => t.id === task.id);
-                    return (
-                      <div key={task.id} className="bg-bg-card border border-border-card rounded-[16px] p-5 shadow-sm hover:shadow-md transition-shadow relative overflow-hidden group text-left">
-                        <div className="absolute left-0 top-0 bottom-0 w-1 bg-brand-primary/60 group-hover:bg-brand-primary transition-colors"></div>
-                        
-                        <div className="flex justify-between items-start mb-1 text-left">
-                          <h3 className="font-bold text-text-main pr-4">{task.title}</h3>
-                          <button 
-                            onClick={() => handleMarkComplete(taskIdx, true)}
-                            className="flex-shrink-0 w-6 h-6 rounded-full border-2 border-border-card flex items-center justify-center text-transparent hover:border-emerald-500 hover:text-emerald-500 hover:bg-emerald-500/10 transition-all cursor-pointer"
-                            title="Mark as completed"
-                          >
-                            <CheckCircle size={14} />
-                          </button>
-                        </div>
-                        {task.project && (
-                          <div className="mb-3 text-left">
-                            <span className="text-[9px] font-bold px-2 py-0.5 rounded-[4px] bg-brand-primary/10 text-brand-primary uppercase tracking-wider">{task.project}</span>
-                          </div>
-                        )}
-                        
-                        <div className="flex items-center gap-4 text-[10px] font-semibold text-text-sec mb-4">
-                          <div className="flex items-center gap-1 bg-bg-base px-2 py-1 rounded-[6px]">
-                            <Clock size={12} className="text-brand-primary" />
-                            <span>Est: {task.duration || 0}h | Rem: {parseFloat(Math.max(0, (task.duration || 0) - calculateTimeSpent(taskReports[task.id] || [])).toFixed(1))}h</span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <MessageSquare size={12} />
-                            <span>{(taskReports[task.id] || []).filter(r => !r.reportText.startsWith("Worked for") && !r.reportText.startsWith("Auto-stopped") && !r.reportText.startsWith("Auto-paused")).length} Updates</span>
-                          </div>
-                          {task.timerStartedAt && (
-                            <div className="flex items-center gap-1 bg-brand-primary/10 text-brand-primary px-2 py-1 rounded-[6px] animate-pulse">
-                              <Activity size={12} />
-                              <span>
-                                {(() => {
-                                  const startedTime = new Date(task.timerStartedAt).getTime();
-                                  const rawElapsed = Math.max(0, Math.floor((now - startedTime) / 1000));
-                                  // Cap session to maximum 8 hours (28800s) to prevent multiday runaway counts
-                                  const elapsedThisSession = Math.min(rawElapsed, 8 * 3600);
-                                  const previousSeconds = Math.floor(calculateTimeSpent(taskReports[task.id] || []) * 3600);
-                                  const totalElapsed = elapsedThisSession + previousSeconds;
-                                  const h = Math.floor(totalElapsed / 3600);
-                                  const m = Math.floor((totalElapsed % 3600) / 60);
-                                  const s = totalElapsed % 60;
-                                  return `${h > 0 ? h + 'h ' : ''}${m}m ${s}s`;
-                                })()}
-                              </span>
-                            </div>
-                          )}
-                        </div>
-                        
-                        <div className="pt-4 border-t border-border-card/50 flex justify-between items-center">
-                          <div className="flex gap-2">
-                            {!task.timerStartedAt ? (
-                              <button 
-                                onClick={async () => {
-                                  const updated = tasks.map(t => ({
-                                    ...t,
-                                    timerStartedAt: t.id === task.id ? new Date().toISOString() : null
-                                  }));
-                                  setTasks(updated);
-                                  await startTaskTimer(currentUser.uid, task.id);
-                                }}
-                                className="py-1.5 px-3 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white rounded-[8px] text-[10px] font-bold transition-colors cursor-pointer inline-flex items-center gap-1.5"
-                              >
-                                <Play size={12} />
-                                <span>Start</span>
-                              </button>
-                            ) : (
-                              <button 
-                                onClick={async () => {
-                                  const updated = tasks.map(t => {
-                                    if (t.id === task.id) return { ...t, timerStartedAt: null };
-                                    return t;
-                                  });
-                                  setTasks(updated);
-                                  await stopTaskTimer(currentUser.uid, task.id, task.assignedBy);
-                                }}
-                                className="py-1.5 px-3 bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white rounded-[8px] text-[10px] font-bold transition-colors cursor-pointer inline-flex items-center gap-1.5"
-                              >
-                                <Square size={12} fill="currentColor" />
-                                <span>Stop Timer</span>
-                              </button>
-                            )}
-                          </div>
-                          <button 
-                            onClick={() => handleOpenReportModal(task)}
-                            className="py-1.5 px-3 bg-brand-primary/10 text-brand-primary hover:bg-brand-primary hover:text-white rounded-[8px] text-[10px] font-bold transition-colors cursor-pointer inline-flex items-center gap-1.5"
-                          >
-                            <Send size={12} />
-                            <span>Manual Update</span>
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                  </div>
-                )}
-              </div>
 
-              {/* Completed Tasks Column */}
-              <div className="space-y-4">
-                <h2 className="font-extrabold text-sm text-text-main uppercase tracking-wider flex items-center gap-2 opacity-80">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                  Completed Tasks ({completedTasks.length})
-                </h2>
-                
-                {completedTasks.length === 0 ? (
-                  <div className="p-6 border border-dashed border-border-card rounded-[16px] text-center text-text-mut text-xs">
-                    No completed tasks yet.
-                  </div>
-                ) : (
-                  <div className="space-y-4 max-h-[600px] overflow-y-auto custom-scrollbar pr-2 pb-2">
-                    {completedTasks.map((task) => {
-                      const taskIdx = tasks.findIndex(t => t.id === task.id);
-                      return (
-                        <div key={task.id} className="bg-bg-base/30 border border-border-card rounded-[16px] p-4 relative overflow-hidden opacity-70 hover:opacity-100 transition-opacity text-left">
-                          <div className="flex justify-between items-start">
-                            <div className="flex items-start gap-3">
-                              <CheckCircle size={16} className="text-emerald-500 mt-0.5 flex-shrink-0" />
-                              <div>
-                                <h3 className="font-bold text-text-sec line-through">{task.title}</h3>
-                                {task.project && <span className="inline-block mt-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded-[4px] bg-bg-card border border-border-card text-text-mut uppercase">{task.project}</span>}
-                                <p className="text-[10px] text-text-mut mt-1">
-                                  Est: {task.duration || 0}h | <span className="text-brand-primary font-bold">Rem: {parseFloat(Math.max(0, (task.duration || 0) - calculateTimeSpent(taskReports[task.id] || [])).toFixed(1))}h</span>
-                                </p>
-                              </div>
-                            </div>
-                            <button 
-                              onClick={() => handleMarkComplete(taskIdx, false)}
-                              className="text-[10px] font-bold text-brand-primary hover:underline cursor-pointer flex-shrink-0 ml-2"
-                            >
-                              Re-open
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">Unviewed &gt; 1h SLA</span>
+              <p className={`text-2xl font-black mt-1 ${adminMetrics.unviewedSlaBreach > 0 ? "text-red-500" : "text-text-main"}`}>
+                {adminMetrics.unviewedSlaBreach}
+              </p>
             </div>
-          )}
 
-          {/* Tabular History directly on page */}
-          <div className="mt-12 bg-bg-card border border-border-card rounded-[24px] p-5 sm:p-6 shadow-xl relative overflow-hidden flex flex-col">
-            <div className="flex flex-col sm:flex-row items-center justify-between mb-5 border-b border-border-card pb-5 gap-3 flex-shrink-0 relative mt-2 text-left">
-              <h3 className="font-bold text-xl text-text-main flex items-center gap-2 whitespace-nowrap">
-                <FileText size={20} className="text-brand-primary" />
-                My Task History
-              </h3>
-              <div className="flex items-center justify-end gap-3 w-full sm:w-auto flex-wrap">
-                {(() => {
-                  const uniqueProjects = [...new Set(tasks.map(t => t.project).filter(Boolean))];
-                  if (uniqueProjects.length > 0) {
-                    return (
-                      <select
-                        value={selectedDownloadProject}
-                        onChange={(e) => setSelectedDownloadProject(e.target.value)}
-                        className="py-2 px-3 bg-bg-base border border-border-card rounded-[10px] text-xs font-bold text-text-main outline-none focus:border-brand-primary/50 transition-colors cursor-pointer"
-                      >
-                        <option value="All">All Projects</option>
-                        {uniqueProjects.map(p => (
-                          <option key={p} value={p}>{p}</option>
-                        ))}
-                      </select>
-                    );
-                  }
-                  return null;
-                })()}
-                <button 
-                  onClick={handleDownloadPDF}
-                  className="py-2 px-4 bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white border border-red-500/20 rounded-[10px] text-xs font-bold transition-all flex items-center gap-2 cursor-pointer shadow-sm"
-                >
-                  <Download size={14} />
-                  <span>Download PDF</span>
-                </button>
-                <button 
-                  onClick={handleDownloadExcel}
-                  className="py-2 px-4 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white border border-emerald-500/20 rounded-[10px] text-xs font-bold transition-all flex items-center gap-2 cursor-pointer shadow-sm"
-                >
-                  <Download size={14} />
-                  <span>Download Excel</span>
-                </button>
-              </div>
+            <div className="bg-bg-card border border-border-card rounded-[18px] p-4 text-left shadow-sm">
+              <span className="text-[11px] font-bold text-text-mut uppercase tracking-wider">Penalized (Absent)</span>
+              <p className={`text-2xl font-black mt-1 ${adminMetrics.penalizedEmployees > 0 ? "text-red-600" : "text-emerald-500"}`}>
+                {adminMetrics.penalizedEmployees}
+              </p>
             </div>
-            
-            <div className="overflow-x-auto w-full custom-scrollbar text-left">
-              <table className="w-full text-left border-collapse">
+          </div>
+
+          {/* Filters Bar */}
+          <div className="bg-bg-card border border-border-card rounded-[18px] p-4 flex flex-wrap gap-4 items-center justify-between shadow-sm">
+            <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[280px]">
+              <input
+                type="text"
+                placeholder="Search tasks or employees..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="bg-bg-base border border-border-card rounded-[10px] px-3.5 py-2 text-xs font-semibold text-text-main placeholder-text-mut focus:outline-none focus:border-brand-primary flex-1 min-w-[200px]"
+              />
+
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                className="bg-bg-base border border-border-card rounded-[10px] px-3 py-2 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
+              >
+                <option value="all">All Statuses</option>
+                <option value="new">New / Unviewed</option>
+                <option value="in-progress">In Progress</option>
+                <option value="completed">Completed</option>
+                <option value="overdue">Overdue</option>
+                <option value="penalized">Penalized (Absent)</option>
+              </select>
+
+              <select
+                value={assigneeFilter}
+                onChange={(e) => setAssigneeFilter(e.target.value)}
+                className="bg-bg-base border border-border-card rounded-[10px] px-3 py-2 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
+              >
+                <option value="all">All Employees</option>
+                {allCompanyUsers.map(u => (
+                  <option key={u.id || u.uid} value={u.id || u.uid}>{u.name} ({u.department || "General"})</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={refreshAdminTasks}
+                className="flex items-center gap-1.5 px-3 py-2 border border-border-card hover:bg-bg-base rounded-[10px] text-xs font-bold text-text-sec transition-all cursor-pointer"
+              >
+                <RotateCcw size={14} />
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          {/* Task Monitoring Table */}
+          <div className="bg-bg-card border border-border-card rounded-[20px] overflow-hidden shadow-sm">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
                 <thead>
-                  <tr className="bg-bg-base/50 text-[10px] uppercase tracking-wider text-text-mut border-b border-border-card">
-                    <th className="p-3 font-bold w-1/4">Employee</th>
-                    <th className="p-3 font-bold w-1/2">Task Title</th>
-                    <th className="p-3 font-bold text-center w-auto">Status</th>
-                    <th className="p-3 font-bold text-right whitespace-nowrap">Est. / Rem.</th>
+                  <tr className="bg-bg-base/60 border-b border-border-card text-text-mut uppercase font-extrabold text-[10px] tracking-wider">
+                    <th className="py-3.5 px-4">Task Details</th>
+                    <th className="py-3.5 px-4">Assigned To</th>
+                    <th className="py-3.5 px-4">Start Time & Deadline</th>
+                    <th className="py-3.5 px-4">1-Hour SLA Status</th>
+                    <th className="py-3.5 px-4">Attendance Status</th>
+                    <th className="py-3.5 px-4 text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody>
-                  {tasks.length === 0 ? (
+                <tbody className="divide-y divide-border-card">
+                  {filteredAdminTasks.length === 0 ? (
                     <tr>
-                      <td colSpan="4" className="p-6 text-center text-xs text-text-mut">No tasks found.</td>
+                      <td colSpan={6} className="py-12 text-center text-text-mut font-medium">
+                        No tasks match the selected criteria.
+                      </td>
                     </tr>
                   ) : (
-                    (() => {
-                      const tasksToExport = selectedDownloadProject === "All" ? tasks : tasks.filter(t => t.project === selectedDownloadProject);
-                      if (tasksToExport.length === 0) {
-                        return (
-                          <tr>
-                            <td colSpan="4" className="p-6 text-center text-xs text-text-mut">No tasks found for selected project.</td>
-                          </tr>
-                        );
-                      }
-                      return tasksToExport.map((task, idx) => (
-                      <React.Fragment key={task.id || idx}>
-                        <tr className="border-b border-border-card/50">
-                          <td className="p-3 text-xs font-bold text-text-main">{currentUser.name}</td>
-                          <td className="p-3 text-xs text-text-main">
-                            <div>{task.title}</div>
-                            {task.project && <div className="text-[9px] text-brand-primary font-bold mt-0.5">{task.project}</div>}
-                          </td>
-                          <td className="p-3 text-xs text-center">
-                            {task.completed ? (
-                              <span className="text-emerald-500 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-[6px]">Done</span>
-                            ) : (
-                              <span className="text-brand-primary font-bold bg-brand-primary/10 px-2 py-0.5 rounded-[6px]">Active</span>
+                    filteredAdminTasks.map(t => {
+                      const effectiveDeadline = getEffectiveDeadline(t);
+                      const countdown = formatCountdown(effectiveDeadline);
+                      const isUnviewedSlaViolated = !t.viewed_at && !t.viewedAt && (now - new Date(t.assigned_at || t.created_at).getTime()) > 60 * 60 * 1000;
+                      const isAbsent = t.employee_attendance_status === "absent";
+                      const isLocked = Boolean(t.employee_is_admin_locked);
+
+                      return (
+                        <tr key={t.id} className="hover:bg-bg-base/30 transition-colors">
+                          {/* Task details */}
+                          <td className="py-3.5 px-4">
+                            <div className="font-bold text-text-main">{t.title}</div>
+                            {t.description && (
+                              <div className="text-[11px] text-text-mut line-clamp-1 mt-0.5">{t.description}</div>
                             )}
-                          </td>
-                          <td className="p-3 text-xs text-right">
-                            <div className="font-bold text-text-main">{task.duration || 0}h</div>
-                            <div className="text-[10px] text-brand-primary font-bold">
-                              {parseFloat(Math.max(0, (task.duration || 0) - calculateTimeSpent(taskReports[task.id] || [])).toFixed(1))}h rem
+                            <div className="flex items-center gap-2 mt-1">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                t.status === "completed" ? "bg-emerald-500/10 text-emerald-600" :
+                                t.status === "in-progress" ? "bg-blue-500/10 text-blue-600" :
+                                "bg-purple-500/10 text-purple-600"
+                              }`}>
+                                {t.status === "completed" ? "Completed" : t.status === "in-progress" ? "In Progress" : "New / Assigned"}
+                              </span>
+                              {t.project_name && (
+                                <span className="text-[10px] font-semibold text-text-mut">Project: {t.project_name}</span>
+                              )}
                             </div>
                           </td>
-                        </tr>
-                        {(!taskReports[task.id] || taskReports[task.id].filter(r => !r.reportText.startsWith("Worked for") && !r.reportText.startsWith("Auto-stopped") && !r.reportText.startsWith("Auto-paused")).length === 0) ? (
-                          <tr className="border-b border-border-card">
-                            <td colSpan="4" className="p-3 bg-bg-base/30 text-center text-[10px] text-text-mut italic">
-                              No updates reported yet
-                            </td>
-                          </tr>
-                        ) : (
-                          <tr className="border-b border-border-card">
-                            <td colSpan="4" className="p-3 bg-bg-base/30">
-                              <div className="pl-4 border-l-2 border-brand-primary/30 space-y-2">
-                                {taskReports[task.id].filter(r => !r.reportText.startsWith("Worked for") && !r.reportText.startsWith("Auto-stopped") && !r.reportText.startsWith("Auto-paused")).map(r => {
-                                  const reportDate = r.timestamp || r.createdAt || r.submittedAt;
-                                  return (
-                                    <div key={r.id} className="text-[10px]">
-                                      <span className="font-bold text-text-sec">[{reportDate ? new Date(reportDate).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : "Recent"}]</span>
-                                      <span className="text-text-main ml-2">{r.reportText}</span>
-                                    </div>
-                                  );
-                                })}
+
+                          {/* Assignee */}
+                          <td className="py-3.5 px-4">
+                            <div className="font-bold text-text-main">{t.assignee_name || t.assigneeName || "Unassigned"}</div>
+                            <div className="text-[11px] text-text-mut">{t.assignee_email || ""}</div>
+                          </td>
+
+                          {/* Timings */}
+                          <td className="py-3.5 px-4">
+                            <div className="text-[11px] font-semibold text-text-sec">
+                              Start: {t.start_time || new Date(t.assigned_at || t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </div>
+                            <div className="text-[11px] font-bold text-text-main mt-0.5">
+                              Deadline: {effectiveDeadline ? new Date(effectiveDeadline).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' }) : (t.duration ? `${t.duration}h duration` : "None")}
+                            </div>
+                            {countdown && (
+                              <div className={`text-[10px] font-bold mt-1 ${countdown.isOverdue ? "text-amber-500 font-extrabold" : "text-emerald-500"}`}>
+                                {countdown.text}
                               </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ));
-                  })()
+                            )}
+                          </td>
+
+                          {/* 1-Hour SLA Status */}
+                          <td className="py-3.5 px-4">
+                            {t.viewed_at || t.viewedAt ? (
+                              <span className="inline-flex items-center gap-1 text-emerald-600 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full text-[11px]">
+                                <Eye size={12} />
+                                Viewed at {new Date(t.viewed_at || t.viewedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            ) : isUnviewedSlaViolated ? (
+                              <span className="inline-flex items-center gap-1 text-red-600 font-bold bg-red-500/10 px-2 py-0.5 rounded-full text-[11px]">
+                                <AlertTriangle size={12} />
+                                SLA Breached (&gt;1h Unviewed)
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 text-purple-600 font-bold bg-purple-500/10 px-2 py-0.5 rounded-full text-[11px] animate-pulse">
+                                <Clock size={12} />
+                                Awaiting Employee View
+                              </span>
+                            )}
+                          </td>
+
+                          {/* Attendance Status */}
+                          <td className="py-3.5 px-4">
+                            {isAbsent ? (
+                              <div className="space-y-1">
+                                <span className="inline-flex items-center gap-1 text-red-600 font-extrabold bg-red-500/15 border border-red-500/30 px-2.5 py-1 rounded-full text-[11px]">
+                                  <ShieldAlert size={12} />
+                                  Marked Absent
+                                </span>
+                                {t.employee_penalty_reason && (
+                                  <div className="text-[10px] text-red-500 font-medium max-w-[180px] line-clamp-2">
+                                    {t.employee_penalty_reason}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 text-emerald-600 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full text-[11px]">
+                                <Check size={12} />
+                                Present
+                              </span>
+                            )}
+                          </td>
+
+                          {/* Actions */}
+                          <td className="py-3.5 px-4 text-right">
+                            {isAbsent && isLocked && (
+                              <button
+                                onClick={() => {
+                                  setSelectedAttendanceRecord({
+                                    id: t.attendance_id || t.assigned_to,
+                                    userName: t.assignee_name || t.assigneeName,
+                                    taskTitle: t.title
+                                  });
+                                  setShowRevertModal(true);
+                                }}
+                                className="inline-flex items-center gap-1 bg-red-500/10 text-red-600 hover:bg-red-500 hover:text-white px-2.5 py-1.5 rounded-[8px] font-bold text-xs transition-colors cursor-pointer"
+                                title="Admin override: restore attendance to Present"
+                              >
+                                <Unlock size={12} />
+                                Unlock / Revert
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>
             </div>
           </div>
-        </>
-      ) : (
-        <div className="space-y-6 text-left">
-          {/* Header block for Daily Log */}
-          <div className="flex justify-between items-center flex-wrap gap-4">
-            <div>
-              <h2 className="text-lg font-bold text-text-main">Daily Activity Log</h2>
-              <p className="text-xs text-text-sec mt-1">Submit your daily updates and view supervisor feedback.</p>
-            </div>
-            <div className="flex items-center gap-3">
-              <button
-                onClick={handleDownloadDailyLogPDF}
-                className="py-2.5 px-4 bg-bg-card hover:bg-bg-base border border-border-card text-text-main text-xs font-bold rounded-[12px] flex items-center gap-2 shadow-sm cursor-pointer transition-colors"
-                title="Download PDF Report"
-              >
-                <FileText size={15} className="text-brand-danger" />
-                <span className="hidden sm:inline">PDF</span>
-              </button>
-              <button
-                onClick={handleDownloadDailyLogExcel}
-                className="py-2.5 px-4 bg-bg-card hover:bg-bg-base border border-border-card text-text-main text-xs font-bold rounded-[12px] flex items-center gap-2 shadow-sm cursor-pointer transition-colors"
-                title="Download Excel Report"
-              >
-                <Download size={15} className="text-brand-success" />
-                <span className="hidden sm:inline">Excel</span>
-              </button>
-              <button
-                onClick={() => {
-                  setLogDate(new Date().toISOString().split("T")[0]);
-                  setShowAddLogModal(true);
-                }}
-                className="py-2.5 px-4 bg-brand-primary hover:bg-brand-hover text-white text-xs font-bold rounded-[12px] shadow-md shadow-brand-primary/10 transition-colors flex items-center gap-1.5 cursor-pointer"
-              >
-                <Plus size={16} />
-                <span>Add Daily Log</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Daily Logs Table */}
-          <div className="bg-bg-card border border-border-card rounded-[24px] overflow-hidden shadow-sm text-left">
-            {dailyReports.length === 0 ? (
-              <div className="py-16 text-center">
-                <div className="w-12 h-12 rounded-full bg-brand-primary/10 text-brand-primary flex items-center justify-center mx-auto mb-3">
-                  <FileText size={22} />
-                </div>
-                <p className="text-sm font-bold text-text-main">No daily logs submitted</p>
-                <p className="text-xs text-text-mut mt-1">You haven't logged any daily activities yet. Click "Add Daily Log" above.</p>
-              </div>
-            ) : (
-              <>
-                <div className="overflow-x-auto w-full custom-scrollbar">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b border-border-card bg-bg-base/30 text-[10px] uppercase font-bold tracking-wider text-text-mut">
-                      <th className="px-6 py-4 w-12 text-center">#</th>
-                      <th className="px-6 py-4 w-28 text-left">Date</th>
-                      <th className="px-6 py-4 w-28 text-left">Day</th>
-                      <th className="px-6 py-4 w-20 text-center">Hours</th>
-                      <th className="px-6 py-4 text-left">Tasks Completed</th>
-                      <th className="px-6 py-4 text-left">Issues Faced</th>
-                      <th className="px-6 py-4 text-left">Supervisor Remarks</th>
-                      <th className="px-6 py-4 text-left">Attachment</th>
-                      <th className="px-6 py-4 w-28 text-center">Status</th>
-                      <th className="px-6 py-4 w-16 text-center">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(() => {
-                      const indexOfLastLog = dailyLogPage * logsPerPage;
-                      const indexOfFirstLog = indexOfLastLog - logsPerPage;
-                      const currentLogs = dailyReports.slice(indexOfFirstLog, indexOfLastLog);
-
-                      return currentLogs.map((report, idx) => {
-                        const actualIdx = indexOfFirstLog + idx;
-                        let statusBadge = "bg-brand-primary/10 text-brand-primary border border-brand-primary/20";
-                      if (report.status === "Completed") statusBadge = "bg-green-500/10 text-green-500 border border-green-500/20";
-                      if (report.status === "On Hold") statusBadge = "bg-red-500/10 text-red-500 border border-red-500/20";
-
-                      return (
-                        <tr key={report.id || actualIdx} className="border-b border-border-card hover:bg-bg-base/20 transition-colors">
-                          <td className="px-6 py-4 font-bold text-center text-text-sec">{actualIdx + 1}</td>
-                          <td className="px-6 py-4 font-bold text-text-main whitespace-nowrap">{report.date}</td>
-                          <td className="px-6 py-4 text-text-sec whitespace-nowrap">{report.day || getDayOfWeek(report.date)}</td>
-                          <td className="px-6 py-4 font-extrabold text-center text-text-main">{report.hours} h</td>
-                          <td className="px-6 py-4">
-                            <div className="max-h-[120px] overflow-y-auto custom-scrollbar text-text-sec max-w-xs break-words whitespace-pre-wrap pr-2">
-                              {report.tasksCompleted}
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            <div className="max-h-[120px] overflow-y-auto custom-scrollbar text-text-mut max-w-xs break-words whitespace-pre-wrap pr-2">
-                              {report.issuesFaced || <span className="italic text-text-mut/40">—</span>}
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            <div className="max-h-[120px] overflow-y-auto custom-scrollbar max-w-xs break-words pr-2">
-                              {report.supervisorRemarks ? (
-                                <span className="text-brand-primary font-bold">{report.supervisorRemarks}</span>
-                              ) : (
-                                <span className="text-text-mut/40 italic">No remarks yet</span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            {report.fileData ? (
-                              <FileCard file={report.fileData} />
-                            ) : (
-                              <span className="text-text-mut/40 italic">None</span>
-                            )}
-                          </td>
-                          <td className="px-6 py-4 text-center">
-                            <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full ${statusBadge}`}>
-                              {report.status}
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 text-center">
-                            <button
-                              onClick={() => handleDeleteDailyLog(report.id)}
-                              className="p-1.5 text-text-mut hover:text-red-500 hover:bg-red-500/10 rounded-[6px] transition-colors cursor-pointer"
-                              title="Delete log"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                      });
-                    })()}
-                  </tbody>
-                </table>
-              </div>
-              
-              {/* Pagination Controls */}
-              {Math.ceil(dailyReports.length / logsPerPage) > 1 && (
-                <div className="flex items-center justify-between px-6 py-4 border-t border-border-card bg-bg-base/10">
-                  <span className="text-xs font-bold text-text-mut">
-                    Showing {(dailyLogPage - 1) * logsPerPage + 1} to {Math.min(dailyLogPage * logsPerPage, dailyReports.length)} of {dailyReports.length}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => setDailyLogPage(p => Math.max(1, p - 1))}
-                      disabled={dailyLogPage === 1}
-                      className="px-3 py-1.5 rounded-lg border border-border-card text-xs font-bold text-text-sec hover:bg-bg-base disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      Previous
-                    </button>
-                    <div className="flex gap-1">
-                      {Array.from({ length: Math.ceil(dailyReports.length / logsPerPage) }, (_, i) => (
-                        <button
-                          key={i}
-                          onClick={() => setDailyLogPage(i + 1)}
-                          className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold transition-colors ${
-                            dailyLogPage === i + 1
-                              ? "bg-brand-primary text-white"
-                              : "text-text-sec hover:bg-bg-base"
-                          }`}
-                        >
-                          {i + 1}
-                        </button>
-                      ))}
-                    </div>
-                    <button
-                      onClick={() => setDailyLogPage(p => Math.min(Math.ceil(dailyReports.length / logsPerPage), p + 1))}
-                      disabled={dailyLogPage === Math.ceil(dailyReports.length / logsPerPage)}
-                      className="px-3 py-1.5 rounded-lg border border-border-card text-xs font-bold text-text-sec hover:bg-bg-base disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      Next
-                    </button>
-                  </div>
-                </div>
-              )}
-              </>
-            )}
-          </div>
         </div>
       )}
 
-      {/* MODALS RENDERED IN PORTALS */}
-
-      {/* Hourly Report Modal */}
-      {showReportModal && selectedTask && createPortal(
-        <div className="fixed inset-0 bg-slate-950/45 dark:bg-black/65 backdrop-blur-[12px] flex items-center justify-center z-[99999] p-6 animate-fade-in text-left">
-          <div className="w-full max-w-[500px] bg-bg-card border border-border-card rounded-[24px] p-6 shadow-xl animate-scale-up relative overflow-hidden flex flex-col max-h-[85vh]">
-            <div className="flex items-center justify-between mb-4 border-b border-border-card pb-4 flex-shrink-0">
-              <h3 className="font-bold text-lg text-text-main flex items-center gap-2">
-                <Play size={18} className="text-brand-primary" fill="currentColor" />
-                Hourly Update
-              </h3>
-              <div className="flex items-center gap-2">
-                <button 
-                  onClick={() => handleDownloadSingleTaskPDF(selectedTask)}
-                  className="py-1.5 px-3 bg-brand-primary/10 text-brand-primary hover:bg-brand-primary hover:text-white rounded-[8px] text-[11px] font-bold transition-colors flex items-center gap-1.5 cursor-pointer"
-                  title="Download Task Report"
-                >
-                  <Download size={13} />
-                  <span>Download</span>
-                </button>
-                <button onClick={() => setShowReportModal(false)} className="text-text-mut hover:text-text-main font-bold cursor-pointer"><X size={18} /></button>
+      {/* ==================================================================== */}
+      {/* 2. MY ASSIGNED TASKS (EMPLOYEE VIEW & PM PERSONAL TASKS) */}
+      {/* ==================================================================== */}
+      {activeSubTab === "my-tasks" && (
+        <div className="space-y-6">
+          {loading ? (
+            <div className="flex justify-center p-12 text-text-mut font-semibold">Loading assigned tasks...</div>
+          ) : tasks.length === 0 ? (
+            <div className="bg-bg-card border border-border-card rounded-[24px] p-12 text-center flex flex-col items-center shadow-sm">
+              <div className="w-16 h-16 bg-brand-primary/10 rounded-full flex items-center justify-center mb-4">
+                <CheckCircle size={32} className="text-brand-primary" />
               </div>
+              <h3 className="text-lg font-bold text-text-main">No Tasks Assigned</h3>
+              <p className="text-xs text-text-sec max-w-sm mt-2">
+                You have no active tasks assigned right now. When an administrator assigns a task, it will appear here immediately with a 1-hour view acknowledgement requirement.
+              </p>
             </div>
-            
-            <div className="flex-grow overflow-y-auto pr-2 custom-scrollbar space-y-4 pb-4">
-              <div className="bg-bg-base/50 p-3 rounded-[12px] border border-border-card">
-                <p className="text-[10px] text-text-sec uppercase font-extrabold tracking-wider mb-1">Task</p>
-                <p className="text-sm font-bold text-text-main">{selectedTask.title}</p>
-              </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Active & New Tasks Column */}
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="font-extrabold text-sm text-text-main uppercase tracking-wider flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse"></span>
+                    Active & New Tasks ({tasks.filter(t => !t.completed).length})
+                  </h2>
+                </div>
 
-              {/* Previous Reports History */}
-              {taskReports[selectedTask.id] && taskReports[selectedTask.id].length > 0 && (
-                <div className="space-y-2 pt-2">
-                  <p className="text-[10px] text-text-sec uppercase font-extrabold tracking-wider">Previous Updates</p>
-                  <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar border border-border-card rounded-[12px] p-2 bg-bg-base/20">
-                    {taskReports[selectedTask.id].filter(r => !r.reportText.startsWith("Worked for") && !r.reportText.startsWith("Auto-stopped") && !r.reportText.startsWith("Auto-paused")).map(r => (
-                      <div key={r.id} className="bg-bg-card p-2 rounded-[8px] border border-border-card/50">
-                        <p className="text-xs text-text-main">{r.reportText}</p>
-                        <p className="text-[9px] text-text-mut mt-1 text-right">
-                          {(() => {
-                            const d = r.timestamp || r.createdAt || r.submittedAt;
-                            return d ? new Date(d).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Just now";
-                          })()}
-                        </p>
-                      </div>
-                    ))}
+                {tasks.filter(t => !t.completed).length === 0 ? (
+                  <div className="p-8 border border-dashed border-border-card rounded-[18px] text-center text-text-mut text-xs">
+                    No active tasks currently pending.
                   </div>
-                </div>
-              )}
+                ) : (
+                  tasks.filter(t => !t.completed).map((task) => {
+                    const effectiveDeadline = getEffectiveDeadline(task);
+                    const countdown = formatCountdown(effectiveDeadline);
+                    const nextReport = getNextReportDue(task);
+                    const isNew = task.status === "new" || (!task.viewed_at && !task.viewedAt);
+                    const isPenalized = task.attendanceStatus === "absent" && task.isAttendanceLocked;
+                    const isDeadlineFinished = Boolean(
+                      !isAdmin && (
+                        (countdown && countdown.isOverdue) ||
+                        (effectiveDeadline && new Date(effectiveDeadline).getTime() < now)
+                      )
+                    );
 
-              <form onSubmit={handleSubmitReport} className="pt-2">
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-bold text-text-sec uppercase tracking-wider">New Update</label>
-                  <textarea 
-                    className="w-full px-3 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all min-h-[100px] resize-none"
-                    placeholder="E.g., Designed the hero section and started on the footer..."
-                    value={reportText}
-                    onChange={(e) => setReportText(e.target.value)}
-                    required
-                  ></textarea>
+                    return (
+                      <div
+                        key={task.id}
+                        className={`bg-bg-card border rounded-[20px] p-5 shadow-sm transition-all relative overflow-hidden text-left ${
+                          isDeadlineFinished
+                            ? "border-amber-500/50 bg-amber-500/[0.03]"
+                            : isPenalized 
+                              ? "border-red-500/40 bg-red-500/[0.02]" 
+                              : isNew 
+                                ? "border-brand-primary/50 shadow-brand-primary/5" 
+                                : "border-border-card hover:border-brand-primary/30"
+                        }`}
+                      >
+                        {/* Status bar */}
+                        <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${
+                          isDeadlineFinished
+                            ? "bg-amber-500"
+                            : isPenalized ? "bg-red-500" : isNew ? "bg-brand-primary animate-pulse" : "bg-blue-500"
+                        }`}></div>
+
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="font-bold text-base text-text-main">{task.title}</h3>
+                              {isNew && (
+                                <span className="bg-brand-primary text-white text-[10px] font-black uppercase px-2 py-0.5 rounded-full animate-bounce">
+                                  New
+                                </span>
+                              )}
+                              {isPenalized && (
+                                <span className="bg-red-500 text-white text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex items-center gap-1">
+                                  <ShieldAlert size={10} />
+                                  Attendance Penalized (Absent)
+                                </span>
+                              )}
+                              {isDeadlineFinished && (
+                                <span className="bg-amber-500/20 text-amber-400 border border-amber-500/30 text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex items-center gap-1">
+                                  <Lock size={10} />
+                                  Deadline Expired (Locked)
+                                </span>
+                              )}
+                            </div>
+                            {task.project && (
+                              <span className="text-[11px] font-semibold text-text-mut">Project: {task.project}</span>
+                            )}
+                          </div>
+
+                          {/* Complete action */}
+                          <button
+                            onClick={() => {
+                              if (isDeadlineFinished) {
+                                showToast("Task deadline has finished. Functionality is locked for this task.", "warning");
+                                return;
+                              }
+                              handleMarkComplete(task, true);
+                            }}
+                            disabled={isDeadlineFinished}
+                            className={`flex-shrink-0 w-7 h-7 rounded-full border-2 flex items-center justify-center transition-all ${
+                              isDeadlineFinished
+                                ? "border-amber-500/40 text-amber-400/70 bg-amber-500/10 cursor-not-allowed opacity-60"
+                                : "border-border-card text-transparent hover:border-emerald-500 hover:text-emerald-500 hover:bg-emerald-500/10 transition-all cursor-pointer"
+                            }`}
+                            title={isDeadlineFinished ? "Task deadline has finished. Completion is locked." : "Mark as completed (triggers SLA evaluation)"}
+                          >
+                            {isDeadlineFinished ? <Lock size={14} /> : <CheckCircle size={16} />}
+                          </button>
+                        </div>
+
+                        {task.description && (
+                          <p className="text-xs text-text-sec mt-2 mb-3 bg-bg-base/40 p-2.5 rounded-[12px] border border-border-card/50">
+                            {task.description}
+                          </p>
+                        )}
+
+                        {/* Deadlines & Timers */}
+                        <div className="grid grid-cols-2 gap-2 my-3 p-3 bg-bg-base/50 rounded-[14px] border border-border-card">
+                          <div>
+                            <span className="text-[10px] font-bold text-text-mut uppercase block">Task Deadline</span>
+                            <span className="text-xs font-bold text-text-main">
+                              {effectiveDeadline ? (
+                                new Date(effectiveDeadline).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })
+                              ) : task.duration ? (
+                                `${task.duration} hours`
+                              ) : (
+                                "No deadline"
+                              )}
+                            </span>
+                            {countdown && (
+                              <span className={`text-[10px] font-extrabold block mt-0.5 ${countdown.isOverdue ? "text-amber-500" : "text-emerald-500"}`}>
+                                {countdown.text}
+                              </span>
+                            )}
+                          </div>
+
+                          <div>
+                            <span className="text-[10px] font-bold text-text-mut uppercase block">Hourly Report</span>
+                            {isDeadlineFinished ? (
+                              <span className="text-xs font-bold text-amber-500 flex items-center gap-1 mt-0.5">
+                                <Lock size={11} /> Locked (Deadline passed)
+                              </span>
+                            ) : nextReport ? (
+                              <span className={`text-xs font-bold block ${nextReport.isOverdue ? "text-red-500 font-extrabold" : "text-blue-500"}`}>
+                                {nextReport.text}
+                              </span>
+                            ) : (
+                              <span className="text-xs font-bold text-text-sec">Due every 5m</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Overdue deadline warning alert */}
+                        {isDeadlineFinished && (
+                          <div className="mb-3 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-[12px] flex items-center gap-2 text-[11px] text-amber-500 font-semibold">
+                            <Lock size={14} className="flex-shrink-0" />
+                            <span>Task deadline has expired. All employee modifications are locked. Contact your administrator if an extension is required.</span>
+                          </div>
+                        )}
+
+                        {/* Action buttons on card */}
+                        <div className="flex items-center justify-between gap-3 pt-2 border-t border-border-card/60">
+                          <button
+                            onClick={() => {
+                              if (isDeadlineFinished) {
+                                showToast("Task deadline has finished. Progress reporting is locked.", "warning");
+                                return;
+                              }
+                              setSelectedTask(task);
+                              setReportTaskId(task.id);
+                              setShowHourlyReportModal(true);
+                            }}
+                            disabled={isDeadlineFinished}
+                            className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-[10px] text-xs font-bold transition-all ${
+                              isDeadlineFinished
+                                ? "bg-amber-500/10 text-amber-400/70 border border-amber-500/20 cursor-not-allowed opacity-60"
+                                : "bg-brand-primary/10 text-brand-primary hover:bg-brand-primary hover:text-white rounded-[10px] text-xs font-bold transition-all cursor-pointer"
+                            }`}
+                            title={isDeadlineFinished ? "Task deadline has finished. Reporting is locked." : "Submit Hourly Report"}
+                          >
+                            {isDeadlineFinished ? <Lock size={13} /> : <Send size={13} />}
+                            {isDeadlineFinished ? "Deadline Expired (Locked)" : "Submit Hourly Report"}
+                          </button>
+
+                          <button
+                            onClick={() => {
+                              setSelectedTask(task);
+                              setShowTaskDetailsModal(true);
+                            }}
+                            className="flex items-center gap-1.5 py-2 px-3 border border-border-card hover:bg-bg-base rounded-[10px] text-xs font-semibold text-text-sec transition-all cursor-pointer"
+                          >
+                            <FileText size={13} />
+                            History
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Completed Tasks Column */}
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="font-extrabold text-sm text-text-main uppercase tracking-wider flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                    Completed Tasks ({tasks.filter(t => t.completed).length})
+                  </h2>
                 </div>
-                <div className="flex justify-end gap-3 pt-4 mt-2">
-                  <button type="button" onClick={() => setShowReportModal(false)} className="py-2.5 px-4 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer">Cancel</button>
-                  <button type="submit" disabled={submitting || !reportText.trim()} className="py-2.5 px-5 bg-brand-primary hover:bg-brand-hover text-white rounded-[10px] text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-2">
-                    <Send size={14} />
-                    <span>{submitting ? "Sending..." : "Submit Report"}</span>
-                  </button>
-                </div>
-              </form>
+
+                {tasks.filter(t => t.completed).length === 0 ? (
+                  <div className="p-8 border border-dashed border-border-card rounded-[18px] text-center text-text-mut text-xs">
+                    No completed tasks yet.
+                  </div>
+                ) : (
+                  tasks.filter(t => t.completed).map((task) => (
+                    <div
+                      key={task.id}
+                      className="bg-bg-card border border-border-card/60 rounded-[18px] p-4 shadow-sm opacity-80 hover:opacity-100 transition-opacity text-left"
+                    >
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <h4 className="font-bold text-sm text-text-main line-through">{task.title}</h4>
+                          <span className={`inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                            task.completionStatus === "completed_on_time" 
+                              ? "bg-emerald-500/10 text-emerald-600" 
+                              : "bg-amber-500/10 text-amber-600"
+                          }`}>
+                            {task.completionStatus === "completed_on_time" ? "Finished Within Deadline" : "Finished Overdue"}
+                          </span>
+                        </div>
+
+                        <button
+                          onClick={() => {
+                            const eff = getEffectiveDeadline(task);
+                            if (!isAdmin && eff && new Date(eff).getTime() < Date.now()) {
+                              showToast("Cannot reopen task: deadline has expired.", "warning");
+                              return;
+                            }
+                            handleMarkComplete(task, false);
+                          }}
+                          className="text-[11px] font-bold text-text-mut hover:text-brand-primary cursor-pointer"
+                        >
+                          Reopen
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
-          </div>
-        </div>,
-        document.body
+          )}
+        </div>
       )}
 
-      {/* Add Daily Activity Log Modal */}
-      {showAddLogModal && createPortal(
-        <div className="fixed inset-0 bg-slate-950/45 dark:bg-black/65 backdrop-blur-[12px] flex items-center justify-center z-[99999] p-6 animate-fade-in text-left">
-          <div className="w-full max-w-[480px] bg-bg-card border border-border-card rounded-[24px] p-6 shadow-xl animate-scale-up relative overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="flex items-center justify-between mb-4 border-b border-border-card pb-4 flex-shrink-0">
-              <h3 className="font-bold text-lg text-text-main flex items-center gap-2">
-                <FileText size={20} className="text-brand-primary" />
-                <span>Add Daily Activity Log</span>
-              </h3>
-              <button onClick={() => setShowAddLogModal(false)} className="text-text-mut hover:text-text-main font-bold cursor-pointer">
+      {/* ==================================================================== */}
+      {/* 3. HOURLY PROGRESS REPORTS STREAM */}
+      {/* ==================================================================== */}
+      {activeSubTab === "hourly-reports" && (
+        <div className="space-y-6">
+          <div className="flex items-center justify-between flex-wrap gap-4 bg-bg-card border border-border-card rounded-[20px] p-5 shadow-sm">
+            <div>
+              <h2 className="text-base font-extrabold text-text-main">Chronological Progress Reports Stream</h2>
+              <p className="text-xs text-text-mut mt-0.5">
+                {isAdmin 
+                  ? "Audit employee hourly submissions, track project percentages, and inspect blockers in real time."
+                  : "Review your submitted hourly progress updates and verification logs."}
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={refreshHourlyReports}
+                className="flex items-center gap-1.5 px-3.5 py-2 border border-border-card hover:bg-bg-base rounded-[10px] text-xs font-bold text-text-sec transition-all cursor-pointer"
+              >
+                <RotateCcw size={14} />
+                Refresh Reports
+              </button>
+            </div>
+          </div>
+
+          {reportsLoading && allHourlyReports.length === 0 ? (
+            <div className="flex justify-center p-12 text-text-mut font-semibold">Loading progress reports...</div>
+          ) : allHourlyReports.length === 0 ? (
+            <div className="bg-bg-card border border-border-card rounded-[24px] p-12 text-center flex flex-col items-center shadow-sm">
+              <div className="w-16 h-16 bg-blue-500/10 rounded-full flex items-center justify-center mb-4">
+                <TrendingUp size={32} className="text-blue-500" />
+              </div>
+              <h3 className="text-lg font-bold text-text-main">No Hourly Reports Submitted Today</h3>
+              <p className="text-xs text-text-sec max-w-sm mt-2">
+                Employees are required to submit hourly progress updates while actively working on tasks.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {allHourlyReports.map((rep) => (
+                <div
+                  key={rep.id}
+                  className="bg-bg-card border border-border-card rounded-[20px] p-5 shadow-sm text-left hover:border-brand-primary/30 transition-all"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-border-card/60">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-bold text-sm text-text-main">{rep.user_name || "Employee"}</span>
+                        <span className="text-xs text-text-mut">({rep.user_email || "Active User"})</span>
+                        <span className="bg-blue-500/10 text-blue-600 px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase">
+                          Hour #{rep.report_hour || 1}
+                        </span>
+                      </div>
+                      <div className="text-xs font-semibold text-brand-primary mt-0.5">
+                        Task: {rep.task_title || "General Workplace Shift"}
+                      </div>
+                    </div>
+
+                    <div className="text-right flex items-center sm:flex-col sm:items-end justify-between gap-1">
+                      <span className="text-[11px] font-bold text-text-mut">
+                        {new Date(rep.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                      <span className="text-[10px] text-text-sec font-semibold">
+                        {new Date(rep.created_at).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-4">
+                    {/* Work Completed */}
+                    <div className="space-y-1">
+                      <span className="text-[11px] font-extrabold text-emerald-600 uppercase tracking-wider block">
+                        Work Completed
+                      </span>
+                      <p className="text-xs text-text-main font-medium leading-relaxed bg-bg-base/40 p-2.5 rounded-[12px] border border-border-card/40">
+                        {rep.work_completed || rep.summary || "No description provided."}
+                      </p>
+                    </div>
+
+                    {/* Pending Work */}
+                    <div className="space-y-1">
+                      <span className="text-[11px] font-extrabold text-blue-600 uppercase tracking-wider block">
+                        Pending Work (Next Hour)
+                      </span>
+                      <p className="text-xs text-text-main font-medium leading-relaxed bg-bg-base/40 p-2.5 rounded-[12px] border border-border-card/40">
+                        {rep.pending_work || rep.next_hour_plan || "Proceeding on current milestone."}
+                      </p>
+                    </div>
+
+                    {/* Progress & Blockers */}
+                    <div className="space-y-2">
+                      <div>
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-[11px] font-extrabold text-text-mut uppercase">Progress</span>
+                          <span className="text-xs font-black text-brand-primary">{rep.progress_percentage || 0}%</span>
+                        </div>
+                        <div className="w-full bg-bg-base rounded-full h-2 overflow-hidden border border-border-card">
+                          <div
+                            className="bg-brand-primary h-full rounded-full transition-all duration-500"
+                            style={{ width: `${Math.min(100, Math.max(0, rep.progress_percentage || 0))}%` }}
+                          ></div>
+                        </div>
+                      </div>
+
+                      {rep.issues_blockers || rep.challenges ? (
+                        <div className="p-2 rounded-[10px] bg-amber-500/10 border border-amber-500/20 text-amber-600 text-[11px] font-medium">
+                          <strong>Blockers:</strong> {rep.issues_blockers || rep.challenges}
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-emerald-600 font-semibold flex items-center gap-1">
+                          <Check size={12} /> No blockers reported
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* 4. DAILY ACTIVITY LOG (PRESERVED FUNCTIONALITY) */}
+      {/* ==================================================================== */}
+      {activeSubTab === "daily-logs" && (
+        <div className="space-y-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-bg-card border border-border-card rounded-[20px] p-5 shadow-sm">
+            <div>
+              <h2 className="text-base font-extrabold text-text-main">Daily Activity Log History</h2>
+              <p className="text-xs text-text-mut mt-0.5">Summary of work logs, daily tasks done, and exported audit logs.</p>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setShowAddLogModal(true)}
+                className="flex items-center gap-2 bg-brand-primary text-white hover:bg-brand-primary/90 px-4 py-2 rounded-[12px] font-bold text-xs shadow-sm transition-all cursor-pointer"
+              >
+                <Plus size={15} />
+                Add Daily Log
+              </button>
+            </div>
+          </div>
+
+          {dailyReports.length === 0 ? (
+            <div className="bg-bg-card border border-border-card rounded-[24px] p-12 text-center flex flex-col items-center shadow-sm">
+              <Calendar size={32} className="text-text-mut mb-3" />
+              <h3 className="text-base font-bold text-text-main">No Daily Activity Logs</h3>
+              <p className="text-xs text-text-sec mt-1">Record your first daily activity log to maintain comprehensive history.</p>
+            </div>
+          ) : (
+            <div className="bg-bg-card border border-border-card rounded-[20px] overflow-hidden shadow-sm">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-bg-base/60 border-b border-border-card text-text-mut uppercase font-extrabold text-[10px] tracking-wider">
+                      <th className="py-3 px-4">Date</th>
+                      <th className="py-3 px-4">Hours</th>
+                      <th className="py-3 px-4">Tasks Completed</th>
+                      <th className="py-3 px-4">Issues Faced</th>
+                      <th className="py-3 px-4">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border-card">
+                    {dailyReports.map((log) => (
+                      <tr key={log.id} className="hover:bg-bg-base/30 transition-colors">
+                        <td className="py-3.5 px-4 font-bold text-text-main">{log.date}</td>
+                        <td className="py-3.5 px-4 font-semibold text-text-sec">{log.hours || 8}h</td>
+                        <td className="py-3.5 px-4 text-text-main max-w-xs">{log.tasksCompleted || log.tasks_done || "—"}</td>
+                        <td className="py-3.5 px-4 text-text-sec max-w-xs">{log.issuesFaced || log.blockers || "None"}</td>
+                        <td className="py-3.5 px-4">
+                          <span className="bg-emerald-500/10 text-emerald-600 px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase">
+                            {log.status || "Completed"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: ADMIN ASSIGN TASK */}
+      {/* ==================================================================== */}
+      {showAssignModal && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-bg-card border border-border-card rounded-[24px] max-w-xl w-full p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto custom-scrollbar">
+            <div className="flex justify-between items-center pb-4 border-b border-border-card mb-5">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-brand-primary/10 flex items-center justify-center text-brand-primary">
+                  <ListTodo size={18} />
+                </div>
+                <h3 className="font-extrabold text-base text-text-main">Assign New Employee Task</h3>
+              </div>
+              <button onClick={() => setShowAssignModal(false)} className="text-text-mut hover:text-text-main cursor-pointer">
                 <X size={18} />
               </button>
             </div>
-            
-            <form onSubmit={handleSaveDailyLog} className="flex-grow overflow-y-auto pr-1 space-y-4 pb-2 custom-scrollbar">
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-text-sec">Projects (Select one or more)</label>
-                  <div className="flex flex-col gap-2 max-h-32 overflow-y-auto bg-bg-base/30 p-3 rounded-[12px] border border-border-card custom-scrollbar">
-                    {projects
-                      .filter(p => (p.teamMembers || []).includes(currentUser?.uid) || p.managerId === currentUser?.uid || (currentUser?.projects || []).includes(p.name))
-                      .map(p => (
-                        <label key={p.id} className="flex items-center gap-2 cursor-pointer">
-                          <input 
-                            type="checkbox" 
-                            className="accent-brand-primary"
-                            checked={logProjectIds.includes(p.id)}
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setLogProjectIds(prev => [...prev, p.id]);
-                              } else {
-                                setLogProjectIds(prev => prev.filter(id => id !== p.id));
-                              }
-                            }}
-                          />
-                          <span className="text-xs text-text-main">{p.name}</span>
-                        </label>
-                    ))}
-                    {projects.filter(p => (p.teamMembers || []).includes(currentUser?.uid) || p.managerId === currentUser?.uid || (currentUser?.projects || []).includes(p.name)).length === 0 && (
-                      <span className="text-xs text-text-mut italic">No projects assigned</span>
-                    )}
-                  </div>
-                </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-xs font-bold text-text-sec">Date</label>
-                  <input 
-                    type="date"
-                    className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
-                    value={logDate}
-                    onChange={(e) => setLogDate(e.target.value)}
-                    required
-                  />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-text-sec">Day (Auto)</label>
-                  <input 
-                    type="text"
-                    className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/20 text-xs text-text-mut outline-none font-bold select-none"
-                    value={getDayOfWeek(logDate)}
-                    disabled
-                  />
-                </div>
+            <form onSubmit={handleAssignTaskSubmit} className="space-y-4 text-left">
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Task Title *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Implement OAuth Flow or Security Audit"
+                  value={assignTitle}
+                  onChange={(e) => setAssignTitle(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-text-sec">Hours Worked</label>
-                  <input 
-                    type="number"
-                    min="0.5"
-                    max="24"
-                    step="0.5"
-                    className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
-                    value={logHours}
-                    onChange={(e) => setLogHours(e.target.value)}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1.5">Assign To Employee *</label>
+                  <select
                     required
-                  />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-text-sec">Status</label>
-                  <select 
-                    className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all cursor-pointer"
-                    value={logStatus}
-                    onChange={(e) => setLogStatus(e.target.value)}
+                    value={assignEmployeeId}
+                    onChange={(e) => setAssignEmployeeId(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
                   >
-                    <option value="Completed">Completed</option>
-                    <option value="In Progress">In Progress</option>
-                    <option value="On Hold">On Hold</option>
+                    <option value="">Select Employee...</option>
+                    {allCompanyUsers.map(u => (
+                      <option key={u.id || u.uid} value={u.id || u.uid}>
+                        {u.name} — {u.department || "General"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1.5">Project (Optional)</label>
+                  <select
+                    value={assignProjectId}
+                    onChange={(e) => setAssignProjectId(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
+                  >
+                    <option value="">Select Project...</option>
+                    {projects.map(p => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
                   </select>
                 </div>
               </div>
 
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-bold text-text-sec">Tasks Completed *</label>
-                <textarea 
-                  className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all min-h-[100px] resize-none"
-                  placeholder="Summarize the tasks you completed today..."
-                  value={logTasksCompleted}
-                  onChange={(e) => setLogTasksCompleted(e.target.value)}
-                  required
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-bold text-text-sec">Issues Faced (Optional)</label>
-                <textarea 
-                  className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all min-h-[80px] resize-none"
-                  placeholder="Describe any blockers or issues faced today..."
-                  value={logIssuesFaced}
-                  onChange={(e) => setLogIssuesFaced(e.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-bold text-text-sec">Attachment (Optional)</label>
-                <div className="relative">
-                  <input 
-                    type="file"
-                    className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all file:mr-4 file:py-1 file:px-3 file:rounded-[8px] file:border-0 file:text-xs file:font-semibold file:bg-brand-primary/10 file:text-brand-primary hover:file:bg-brand-primary/20"
-                    onChange={(e) => setPendingFile(e.target.files[0] || null)}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1.5">Task Start Date & Time</label>
+                  <input
+                    type="datetime-local"
+                    value={assignStartTime}
+                    onChange={(e) => setAssignStartTime(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
                   />
-                  {pendingFile && (
-                    <button
-                      type="button"
-                      onClick={() => setPendingFile(null)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-mut hover:text-red-500 rounded-full hover:bg-bg-card transition-colors"
-                      title="Remove file"
-                    >
-                      <X size={14} />
-                    </button>
-                  )}
                 </div>
-                {uploadingFile && (
-                  <p className="text-[10px] text-brand-primary font-bold mt-1 animate-pulse">
-                    File will be securely uploaded when saving...
-                  </p>
-                )}
+
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1.5">Task Deadline (Target SLA) *</label>
+                  <input
+                    type="datetime-local"
+                    required
+                    value={assignDeadline}
+                    onChange={(e) => setAssignDeadline(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                  />
+                </div>
               </div>
 
-              <div className="flex gap-3 justify-end pt-4 border-t border-border-card flex-shrink-0">
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Priority</label>
+                <select
+                  value={assignPriority}
+                  onChange={(e) => setAssignPriority(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
+                >
+                  <option value="low">Low Priority</option>
+                  <option value="medium">Medium Priority</option>
+                  <option value="high">High Priority</option>
+                  <option value="urgent">Urgent</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Task Description</label>
+                <textarea
+                  rows={3}
+                  placeholder="Provide detailed instructions and deliverables..."
+                  value={assignDesc}
+                  onChange={(e) => setAssignDesc(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+
+              <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-[12px] text-[11px] text-blue-600 font-medium">
+                <strong>SLA Rule:</strong> The employee will receive an immediate notification with the deadline and must open or acknowledge this task within <strong>1 hour</strong>. If unviewed, attendance is automatically marked absent.
+              </div>
+
+              <div className="flex justify-end gap-3 pt-3">
                 <button
                   type="button"
-                  onClick={() => setShowAddLogModal(false)}
-                  className="py-2.5 px-4 bg-bg-base hover:bg-border-card text-text-sec text-xs font-bold rounded-[12px] transition-colors cursor-pointer"
+                  onClick={() => setShowAssignModal(false)}
+                  className="px-4 py-2.5 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={submitting}
-                  className="py-2.5 px-5 bg-brand-primary hover:bg-brand-hover text-white text-xs font-bold rounded-[12px] shadow-md shadow-brand-primary/10 transition-colors cursor-pointer disabled:opacity-50"
+                  className="px-5 py-2.5 bg-brand-primary text-white rounded-[10px] text-xs font-bold hover:bg-brand-primary/90 transition-all cursor-pointer shadow-sm disabled:opacity-50"
                 >
-                  {submitting ? (uploadingFile ? "Uploading..." : "Submitting...") : "Save Log"}
+                  {submitting ? "Assigning..." : "Assign Task"}
                 </button>
               </div>
             </form>
@@ -1245,7 +1481,284 @@ export default function TaskManagement() {
         document.body
       )}
 
+      {/* ==================================================================== */}
+      {/* MODAL: SUBMIT HOURLY PROGRESS REPORT */}
+      {/* ==================================================================== */}
+      {showHourlyReportModal && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-bg-card border border-border-card rounded-[24px] max-w-xl w-full p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto custom-scrollbar">
+            <div className="flex justify-between items-center pb-4 border-b border-border-card mb-5">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-600">
+                  <TrendingUp size={18} />
+                </div>
+                <h3 className="font-extrabold text-base text-text-main">Submit Hourly Progress Report</h3>
+              </div>
+              <button onClick={() => setShowHourlyReportModal(false)} className="text-text-mut hover:text-text-main cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleHourlyReportSubmit} className="space-y-4 text-left">
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Select Active Task *</label>
+                <select
+                  required
+                  value={reportTaskId || (selectedTask ? selectedTask.id : "")}
+                  onChange={(e) => {
+                    setReportTaskId(e.target.value);
+                    const found = tasks.find(t => t.id === e.target.value);
+                    if (found) setSelectedTask(found);
+                  }}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary cursor-pointer"
+                >
+                  <option value="">Select an assigned task...</option>
+                  {tasks.filter(t => !t.completed).map(t => {
+                    const effDl = getEffectiveDeadline(t);
+                    const isExpired = Boolean(!isAdmin && effDl && new Date(effDl).getTime() < Date.now());
+                    return (
+                      <option key={t.id} value={t.id} disabled={isExpired}>
+                        {t.title} {t.project ? `(${t.project})` : ""} {isExpired ? " [Deadline Finished - Locked]" : ""}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Work Completed During This Hour *</label>
+                <textarea
+                  required
+                  rows={3}
+                  placeholder="Detail the code written, research conducted, or bugs fixed..."
+                  value={reportWorkCompleted}
+                  onChange={(e) => setReportWorkCompleted(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center mb-1.5">
+                  <label className="text-xs font-bold text-text-main">Current Progress Percentage</label>
+                  <span className="text-xs font-black text-brand-primary">{reportProgressPercent}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={reportProgressPercent}
+                  onChange={(e) => setReportProgressPercent(e.target.value)}
+                  className="w-full accent-brand-primary cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Pending Work (Next Hour Plan) *</label>
+                <textarea
+                  required
+                  rows={2}
+                  placeholder="What will you work on during the upcoming hour?"
+                  value={reportPendingWork}
+                  onChange={(e) => setReportPendingWork(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Issues or Blockers (Optional)</label>
+                <textarea
+                  rows={2}
+                  placeholder="Any roadblocks, dependencies, or unanswered questions..."
+                  value={reportIssuesBlockers}
+                  onChange={(e) => setReportIssuesBlockers(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+
+              <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-[12px] text-[11px] text-amber-600 font-medium">
+                <strong>Continuous Compliance Rule:</strong> You must submit a progress report every 5 minutes. If 10 minutes pass without a submission, attendance will be locked as Absent.
+              </div>
+
+              <div className="flex justify-end gap-3 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowHourlyReportModal(false)}
+                  className="px-4 py-2.5 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-5 py-2.5 bg-brand-primary text-white rounded-[10px] text-xs font-bold hover:bg-brand-primary/90 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                >
+                  {submitting ? "Submitting..." : "Submit Report"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: REVERT ATTENDANCE PENALTY (ADMIN ONLY) */}
+      {/* ==================================================================== */}
+      {showRevertModal && selectedAttendanceRecord && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-bg-card border border-border-card rounded-[24px] max-w-md w-full p-6 shadow-2xl relative text-left">
+            <div className="flex justify-between items-center pb-4 border-b border-border-card mb-4">
+              <div className="flex items-center gap-2.5 text-amber-500">
+                <Unlock size={20} />
+                <h3 className="font-extrabold text-base text-text-main">Revert Attendance Penalty</h3>
+              </div>
+              <button onClick={() => setShowRevertModal(false)} className="text-text-mut hover:text-text-main cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <p className="text-xs text-text-sec mb-4">
+              You are about to restore attendance to <strong>Present</strong> and lift the lock for <strong>{selectedAttendanceRecord.userName}</strong>.
+            </p>
+
+            <form onSubmit={handleRevertPenaltySubmit} className="space-y-4">
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1.5">Administrative Resolution Notes</label>
+                <textarea
+                  rows={3}
+                  required
+                  placeholder="Explain why this penalty is being lifted (e.g. system downtime, verified offline work)..."
+                  value={revertNotes}
+                  onChange={(e) => setRevertNotes(e.target.value)}
+                  className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
+                />
+              </div>
+
+              <div className="flex justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowRevertModal(false)}
+                  className="px-4 py-2 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-5 py-2 bg-emerald-600 text-white rounded-[10px] text-xs font-bold hover:bg-emerald-700 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                >
+                  {submitting ? "Reverting..." : "Revert & Unlock"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: ADD DAILY LOG (PRESERVED) */}
+      {/* ==================================================================== */}
+      {showAddLogModal && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-bg-card border border-border-card rounded-[24px] max-w-lg w-full p-6 shadow-2xl relative text-left">
+            <div className="flex justify-between items-center pb-4 border-b border-border-card mb-4">
+              <h3 className="font-extrabold text-base text-text-main">Add Daily Activity Log</h3>
+              <button onClick={() => setShowAddLogModal(false)} className="text-text-mut hover:text-text-main cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              if (!logTasksCompleted.trim()) return showToast("Tasks completed is required.", "warning");
+              setSubmitting(true);
+              try {
+                await addDailyReport(currentUser.uid, {
+                  date: logDate,
+                  hours: logHours,
+                  tasksCompleted: logTasksCompleted,
+                  issuesFaced: logIssuesFaced,
+                  status: logStatus
+                });
+                showToast("Daily activity log saved!", "success");
+                setShowAddLogModal(false);
+                setLogTasksCompleted("");
+                setLogIssuesFaced("");
+              } catch (err) {
+                showToast("Failed to save log.", "error");
+              } finally {
+                setSubmitting(false);
+              }
+            }} className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1">Date</label>
+                  <input
+                    type="date"
+                    value={logDate}
+                    onChange={(e) => setLogDate(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[10px] p-2.5 text-xs text-text-main"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-text-main block mb-1">Hours Spent</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="24"
+                    value={logHours}
+                    onChange={(e) => setLogHours(e.target.value)}
+                    className="w-full bg-bg-base border border-border-card rounded-[10px] p-2.5 text-xs text-text-main"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1">Tasks Completed *</label>
+                <textarea
+                  required
+                  rows={3}
+                  value={logTasksCompleted}
+                  onChange={(e) => setLogTasksCompleted(e.target.value)}
+                  placeholder="Summary of daily deliverables..."
+                  className="w-full bg-bg-base border border-border-card rounded-[10px] p-2.5 text-xs text-text-main"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-text-main block mb-1">Issues Faced</label>
+                <textarea
+                  rows={2}
+                  value={logIssuesFaced}
+                  onChange={(e) => setLogIssuesFaced(e.target.value)}
+                  placeholder="Any technical or logistical obstacles..."
+                  className="w-full bg-bg-base border border-border-card rounded-[10px] p-2.5 text-xs text-text-main"
+                />
+              </div>
+
+              <div className="flex justify-end gap-3 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAddLogModal(false)}
+                  className="px-4 py-2 border border-border-card rounded-[10px] text-xs font-bold text-text-sec cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-5 py-2 bg-brand-primary text-white rounded-[10px] text-xs font-bold hover:bg-brand-primary/90 cursor-pointer disabled:opacity-50"
+                >
+                  Save Log
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
-

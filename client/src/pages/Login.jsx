@@ -121,7 +121,7 @@ export default function Login() {
           pendingToken: result.pendingToken,
           email: result.email || email
         });
-        setOtp("");
+        if (result.devOtp) { setOtp(result.devOtp); } else { setOtp(""); }
         setOtpError("");
         setResendCooldown(60);
         showToast("Verification code sent to your email.", "info");

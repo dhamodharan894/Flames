@@ -1429,3 +1429,81 @@ export const createVerificationSession = async (req, res) => {
     distance: verifyResult.distance
   });
 };
+
+
+export const adminRevertPenalty = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resolutionNotes = "" } = req.body || {};
+    const adminId = req.user?.id;
+    const userRole = (req.user?.role || "").toLowerCase();
+
+    if (userRole !== "admin" && userRole !== "superadmin") {
+      return res.status(403).json({ error: "Only an Admin or Superadmin can resolve compliance penalties and revert attendance." });
+    }
+
+    const existingRes = await query("SELECT * FROM attendance WHERE id = $1", [id]);
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: "Attendance record not found." });
+    }
+
+    const record = existingRes.rows[0];
+
+    const result = await query(
+      `UPDATE attendance
+       SET status = 'present',
+           is_admin_locked = FALSE,
+           penalty_status = NULL,
+           penalty_reason = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    const updated = result.rows[0];
+
+    const notifId = "notif_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+    await query(
+      `INSERT INTO notifications (id, user_id, title, message, type, read, link)
+       VALUES ($1, $2, $3, $4, 'info', FALSE, '/attendance')`,
+      [
+        notifId,
+        record.user_id,
+        "Attendance Penalty Resolved by Admin",
+        `Your attendance penalty has been resolved by Admin. Status restored to Present and reporting lock removed.`
+      ]
+    );
+
+    const io = req.app?.get("io");
+    if (io) {
+      const payload = {
+        attendanceId: id,
+        userId: record.user_id,
+        status: "present",
+        is_admin_locked: false,
+        resolutionNotes
+      };
+      io.to(`user_${record.user_id}`).emit("attendance_penalty_reverted", payload);
+      if (record.company_id) io.to(`company_${record.company_id}`).emit("attendance_penalty_reverted", payload);
+      io.emit("attendance_penalty_reverted", payload);
+    }
+
+    auditService.logAudit({
+      userId: adminId,
+      action: "ATTENDANCE_PENALTY_REVERT",
+      resourceType: "attendance",
+      resourceId: id,
+      details: { previousPenalty: record.penalty_status, previousReason: record.penalty_reason, resolutionNotes },
+      req
+    });
+
+    res.json({
+      message: "Attendance penalty resolved. Status restored to Present.",
+      attendance: updated
+    });
+  } catch (err) {
+    console.error("adminRevertPenalty error:", err);
+    res.status(500).json({ error: "Failed to revert attendance penalty." });
+  }
+};

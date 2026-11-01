@@ -236,21 +236,21 @@ export default function App() {
         <Route 
           path="/project-management" 
           element={
-            <ProtectedRoute>
+            <AdminRoute>
               <DashboardLayout>
                 <ProjectManagement />
               </DashboardLayout>
-            </ProtectedRoute>
+            </AdminRoute>
           } 
         />
         <Route 
           path="/project-calendar" 
           element={
-            <ProtectedRoute>
+            <AdminRoute>
               <DashboardLayout>
                 <ProjectCalendar />
               </DashboardLayout>
-            </ProtectedRoute>
+            </AdminRoute>
           } 
         />
         <Route 

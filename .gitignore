@@ -52,3 +52,7 @@ __pycache__/
 # Root markdown documentation excluded from production repo
 /*.md
 
+
+.venv/
+venv/
+face_service/.venv/

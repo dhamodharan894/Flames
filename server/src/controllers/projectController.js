@@ -284,13 +284,11 @@ export const deleteProject = async (req, res) => {
     // Verify project exists and belongs to company
     const checkRes = await client.query("SELECT id, company_id FROM projects WHERE id = $1", [id]);
     if (checkRes.rows.length === 0) {
-      client.release();
       return res.status(404).json({ error: "Project not found." });
     }
 
     const project = checkRes.rows[0];
     if (!isSuperAdmin && req.user?.companyId && project.company_id && project.company_id !== req.user.companyId) {
-      client.release();
       return res.status(403).json({ error: "Access denied. Cannot delete project from another organization." });
     }
 

@@ -462,3 +462,225 @@ export const createTaskReport = async (req, res) => {
     res.status(500).json({ error: "Failed to create task report." });
   }
 };
+
+
+export const getHourlyReports = async (req, res) => {
+  try {
+    const { companyId, userId, date } = req.query;
+    const targetCompanyId = companyId || req.user?.companyId;
+    const today = date || new Date().toISOString().split("T")[0];
+
+    let sql = `
+      SELECT hr.*, u.name as user_name, u.email as user_email, u.department as user_dept,
+             t.title as task_title
+      FROM hourly_reports hr
+      JOIN users u ON hr.user_id = u.id
+      LEFT JOIN tasks t ON hr.task_id = t.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (targetCompanyId) {
+      params.push(targetCompanyId);
+      sql += ` AND hr.company_id = $${params.length}`;
+    }
+
+    if (req.user?.role === "employee") {
+      params.push(req.user.id);
+      sql += ` AND hr.user_id = $${params.length}`;
+    } else if (userId) {
+      params.push(userId);
+      sql += ` AND hr.user_id = $${params.length}`;
+    }
+
+    if (today) {
+      params.push(today);
+      sql += ` AND hr.report_date = $${params.length}`;
+    }
+
+    sql += " ORDER BY hr.created_at DESC LIMIT 500";
+    const result = await query(sql, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("getHourlyReports error:", err);
+    res.status(500).json({ error: "Failed to fetch hourly reports." });
+  }
+};
+
+export const submitHourlyReport = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.body.userId;
+    const companyId = req.user?.companyId || req.body.companyId;
+    const {
+      summary,
+      challenges = "",
+      nextHourPlan = "",
+      workCompleted = "",
+      progressPercentage = 0,
+      pendingWork = "",
+      issuesBlockers = "",
+      reportHour,
+      taskId = null
+    } = req.body;
+    const today = new Date().toISOString().split("T")[0];
+
+    const actualWorkCompleted = (workCompleted || summary || "").trim();
+    if (!actualWorkCompleted) {
+      return res.status(400).json({ error: "Work completed summary is required." });
+    }
+
+    const actualPendingWork = (pendingWork || nextHourPlan || "").trim();
+    const actualIssues = (issuesBlockers || challenges || "").trim();
+    const actualProgress = Math.min(100, Math.max(0, parseInt(progressPercentage, 10) || 0));
+
+    // Check attendance for today
+    const attRes = await query(
+      "SELECT id, status, is_admin_locked, check_in FROM attendance WHERE user_id = $1 AND date = $2 LIMIT 1",
+      [userId, today]
+    );
+
+    let attendance = attRes.rows[0];
+
+    // If no attendance record exists today, auto-check-in the employee upon submitting task report
+    if (!attendance) {
+      const attId = "att_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+      const newAtt = await query(
+        `INSERT INTO attendance (id, user_id, company_id, date, status, check_in, last_hourly_report_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'present', NOW(), NOW(), NOW(), NOW())
+         RETURNING *`,
+        [attId, userId, companyId, today]
+      );
+      attendance = newAtt.rows[0];
+    } else if (!attendance.check_in) {
+      const updated = await query(
+        `UPDATE attendance SET check_in = NOW(), status = 'present', last_hourly_report_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *`,
+        [attendance.id]
+      );
+      attendance = updated.rows[0];
+    }
+
+    // If taskId is provided, verify task deadline and auto-unblock if extended by admin
+    if (taskId) {
+      const tRes = await query("SELECT * FROM tasks WHERE id = $1", [taskId]);
+      if (tRes.rows.length > 0) {
+        const t = tRes.rows[0];
+        const meta = (t.metadata && typeof t.metadata === "object") ? t.metadata : {};
+        const candidateDeadlines = [
+          t.deadline ? new Date(t.deadline).getTime() : 0,
+          t.due_date ? new Date(t.due_date).getTime() : 0,
+          meta.deadlineTimestamp ? new Date(meta.deadlineTimestamp).getTime() : 0
+        ].filter(ts => ts > 0 && !isNaN(ts));
+
+        let exactDeadline = candidateDeadlines.length > 0 ? new Date(Math.max(...candidateDeadlines)) : null;
+
+        if (!exactDeadline) {
+          const durHours = Number(t.duration) || (t.duration_minutes ? Number(t.duration_minutes) / 60 : 0) || Number(meta.duration || 0);
+          if (durHours > 0) {
+            const base = t.assigned_at || t.start_time || t.created_at;
+            if (base) {
+              exactDeadline = new Date(new Date(base).getTime() + durHours * 3600 * 1000);
+            }
+          }
+        }
+
+        if (exactDeadline && !isNaN(exactDeadline.getTime())) {
+          const nowMs = Date.now();
+          const isOverdue = (meta.deadlineTimestamp && typeof meta.deadlineTimestamp === "string" && meta.deadlineTimestamp.includes("T"))
+            ? nowMs > exactDeadline.getTime()
+            : (t.deadline ? nowMs > exactDeadline.getTime() : nowMs > new Date(exactDeadline).setUTCHours(23, 59, 59, 999));
+
+          if (!isOverdue) {
+            // Admin extended deadline: auto-unblock reporting and restore attendance!
+            await query(
+              `UPDATE attendance
+               SET status = 'present',
+                   is_admin_locked = FALSE,
+                   penalty_status = NULL,
+                   penalty_reason = NULL,
+                   updated_at = NOW()
+               WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day')`,
+              [userId]
+            );
+            if (attendance) {
+              attendance.is_admin_locked = false;
+              attendance.status = "present";
+            }
+            // Clear task penalty flag and overdue state
+            await query("UPDATE tasks SET sla_penalty_applied = FALSE, overdue = FALSE WHERE id = $1", [taskId]);
+          } else if (req.user?.role !== "admin") {
+            return res.status(403).json({
+              error: "Task deadline has finished. Progress reporting is locked for this task.",
+              locked: true
+            });
+          }
+        }
+      }
+    }
+
+    // If attendance is still locked due to an active SLA penalty today
+    if (attendance && attendance.is_admin_locked) {
+      return res.status(403).json({
+        error: "Reporting is locked because your attendance was marked absent due to SLA penalty. Please contact Admin to unlock.",
+        locked: true
+      });
+    }
+
+    let currentHour = reportHour;
+    if (!currentHour) {
+      const existingCount = await query(
+        "SELECT COUNT(*)::int as count FROM hourly_reports WHERE user_id = $1 AND report_date = $2",
+        [userId, today]
+      );
+      currentHour = (existingCount.rows[0]?.count || 0) + 1;
+    }
+
+    const id = "hr_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+    const result = await query(
+      `INSERT INTO hourly_reports (
+        id, company_id, user_id, task_id, report_hour, report_date,
+        summary, challenges, next_hour_plan,
+        work_completed, progress_percentage, pending_work, issues_blockers,
+        created_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+      RETURNING *`,
+      [
+        id, companyId, userId, taskId || null, currentHour, today,
+        actualWorkCompleted, actualIssues, actualPendingWork,
+        actualWorkCompleted, actualProgress, actualPendingWork, actualIssues
+      ]
+    );
+
+    if (attendance) {
+      await query(
+        "UPDATE attendance SET last_hourly_report_at = NOW(), updated_at = NOW() WHERE id = $1",
+        [attendance.id]
+      );
+    }
+
+    if (taskId) {
+      await query(
+        "UPDATE tasks SET last_reported_at = NOW(), updated_at = NOW() WHERE id = $1",
+        [taskId]
+      );
+      const trId = "tr_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+      await query(
+        `INSERT INTO task_reports (id, task_id, user_id, company_id, content, time_spent_minutes, submitted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+        [trId, taskId, userId, companyId, actualWorkCompleted, 60]
+      ).catch(() => {});
+    }
+
+    const reportRow = result.rows[0];
+    const io = req.app?.get("io");
+    if (io) {
+      if (companyId) io.to(`company_${companyId}`).emit("hourly_report_submitted", reportRow);
+      io.emit("hourly_report_submitted", reportRow);
+    }
+
+    res.status(201).json(reportRow);
+  } catch (err) {
+    console.error("submitHourlyReport error:", err);
+    res.status(500).json({ error: "Failed to submit hourly report." });
+  }
+};

@@ -224,31 +224,55 @@ export const updateUser = async (req, res) => {
             const proj = t.project || t.projectId || null;
             const targetCompany = targetUser.company_id || req.user?.companyId || "carrezza-global-solutions";
             const assignedBy = t.assignedBy || req.user?.id || null;
+            const durHours = Number(t.duration) || (t.durationMinutes ? Number(t.durationMinutes) / 60 : 0);
+            const assignedAt = t.assignedAt || t.assigned_at || new Date().toISOString();
+            let deadline = t.deadline || t.dueDate || t.due_date || null;
+            if (!deadline && durHours > 0) {
+              const baseMs = new Date(assignedAt).getTime();
+              deadline = new Date(baseMs + durHours * 3600 * 1000).toISOString();
+            }
+            const durationMinutes = durHours > 0 ? Math.round(durHours * 60) : (t.duration_minutes || 60);
 
             await query(
-              `INSERT INTO tasks (id, company_id, title, description, assigned_to, project_id, status, created_by, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+              `INSERT INTO tasks (id, company_id, title, description, assigned_to, project_id, status, created_by, due_date, deadline, duration_minutes, assigned_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
                ON CONFLICT (id) DO UPDATE SET
                  status = EXCLUDED.status,
                  title = EXCLUDED.title,
                  description = EXCLUDED.description,
                  assigned_to = EXCLUDED.assigned_to,
                  project_id = COALESCE(EXCLUDED.project_id, tasks.project_id),
+                 due_date = COALESCE(EXCLUDED.due_date, tasks.due_date),
+                 deadline = COALESCE(EXCLUDED.deadline, tasks.deadline),
+                 duration_minutes = COALESCE(EXCLUDED.duration_minutes, tasks.duration_minutes),
+                 assigned_at = COALESCE(tasks.assigned_at, EXCLUDED.assigned_at),
                  updated_at = CURRENT_TIMESTAMP`,
-              [taskId, targetCompany, title, desc, id, proj, status, assignedBy]
-            ).catch(() => {});
-          }
+              [taskId, targetCompany, title, desc, id, proj, status, assignedBy, deadline, deadline, durationMinutes, assignedAt]
+            ).catch(err => console.error("Sync task error:", err.message));
 
-          if (currentTaskIds.length > 0) {
-            await query(
-              "DELETE FROM tasks WHERE assigned_to = $1 AND NOT (id = ANY($2))",
-              [id, currentTaskIds]
-            ).catch(() => {});
-          } else {
-            await query(
-              "DELETE FROM tasks WHERE assigned_to = $1",
-              [id]
-            ).catch(() => {});
+            // Auto-unblock employee attendance if deadline extended into future
+            if (deadline && new Date(deadline).getTime() > Date.now()) {
+              await query(
+                `UPDATE attendance
+                 SET status = 'present',
+                     is_admin_locked = FALSE,
+                     penalty_status = NULL,
+                     penalty_reason = NULL,
+                     updated_at = NOW()
+                 WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') AND is_admin_locked = TRUE`,
+                [id]
+              ).catch(() => {});
+
+              await query(
+                `UPDATE tasks 
+                 SET sla_penalty_applied = FALSE, 
+                     overdue = FALSE, 
+                     last_reported_at = NOW(),
+                     metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{deadlineTimestamp}', to_jsonb($2::text))
+                 WHERE id = $1`,
+                [taskId, new Date(deadline).toISOString()]
+              ).catch(() => {});
+            }
           }
         }
       } catch (syncErr) {
@@ -423,20 +447,17 @@ export const deleteUser = async (req, res) => {
     // Check target user
     const checkRes = await client.query("SELECT id, name, email, role, company_id FROM users WHERE id = $1", [id]);
     if (checkRes.rows.length === 0) {
-      client.release();
       return res.status(404).json({ error: "User not found." });
     }
     const target = checkRes.rows[0];
 
     // Cannot delete superadmin unless caller is superadmin
     if (target.role === "superadmin" && !isSuperAdmin) {
-      client.release();
       return res.status(403).json({ error: "Access denied. Cannot delete Superadmin." });
     }
 
     // Tenant check: Admin can only delete users in their own company
     if (!isSuperAdmin && req.user?.companyId && target.company_id && target.company_id !== req.user.companyId) {
-      client.release();
       return res.status(403).json({ error: "Access denied. Cannot delete user from another organization." });
     }
 

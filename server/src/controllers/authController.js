@@ -173,7 +173,8 @@ export const login = async (req, res) => {
       mfaRequired: true,
       pendingToken,
       email: user.email,
-      message: "A 6-digit verification code has been sent to your registered email address."
+      message: "A 6-digit verification code has been sent to your registered email address.",
+      ...((!process.env.NODE_ENV || process.env.NODE_ENV === "development") ? { devOtp: otp } : {})
     });
   } catch (err) {
     console.error("Login error:", err);

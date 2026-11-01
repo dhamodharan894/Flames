@@ -757,6 +757,13 @@ export default function DashboardLayout({ children }) {
         active: location.pathname === "/project-calendar",
         module: "projects",
         onClick: () => { navigate("/project-calendar"); setIsMobileOpen(false); }
+      },
+      {
+        label: "Task Management",
+        icon: CheckSquare,
+        active: location.pathname === "/task-management",
+        module: "tasks",
+        onClick: () => { navigate("/task-management"); setIsMobileOpen(false); }
       }
     );
 
@@ -861,23 +868,6 @@ export default function DashboardLayout({ children }) {
         badge: showTeamHubBadge ? realUnreadMessagesCount : null,
         module: "team-hub",
         onClick: () => { navigate("/team-hub"); setIsMobileOpen(false); }
-      },
-      {
-        label: "Project Management",
-        icon: Briefcase,
-        active: location.pathname === "/project-management",
-        hidden: !(currentUser?.isProjectManager || currentUser?.role === "Project Manager" || currentUser?.role === "admin" || currentUser?.name === "Mohamed Asfaque A" || can('read', 'ProjectManagement')),
-        badge: location.pathname === "/project-management" ? null : (showProjectsBadge ? activeProjects.length : null),
-        module: "projects",
-        onClick: () => { navigate("/project-management"); setIsMobileOpen(false); }
-      },
-      {
-        label: "Project Calendar",
-        icon: Calendar,
-        active: location.pathname === "/project-calendar",
-        hidden: !(currentUser?.isProjectManager || currentUser?.role === "Project Manager" || currentUser?.role === "admin" || currentUser?.name === "Mohamed Asfaque A" || can('read', 'ProjectManagement')),
-        module: "projects",
-        onClick: () => { navigate("/project-calendar"); setIsMobileOpen(false); }
       },
       {
         label: "Task Management",
