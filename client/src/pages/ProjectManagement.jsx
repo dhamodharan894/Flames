@@ -1360,18 +1360,6 @@ export default function ProjectManagement() {
       await updateUserTasks(taskTargetUser.uid, currentTasks);
       
       if (editingTaskIndex === null) {
-        await assignTask({
-          title: newTaskTitle.trim(),
-          assignedTo: taskTargetUser.uid,
-          projectId: newTaskProject || null,
-          deadline: calculatedDeadline,
-          dueDate: calculatedDeadline,
-          priority: "medium",
-          duration: durHours,
-          durationMinutes: durHours * 60,
-          companyId: currentUser.companyId
-        }).catch(err => console.warn("assignTask API fallback:", err));
-
         await createNotification(
           taskTargetUser.uid,
           "New Task Assigned",

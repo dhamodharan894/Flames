@@ -966,11 +966,19 @@ export const subscribeToUserTasks = (userId, callback) => {
         const directTasks = await apiFetch(`/tasks?assignedTo=${userId}`);
         if (Array.isArray(directTasks)) {
           const seen = new Set();
+          const seenSignatures = new Set();
           tasks = [];
           for (const dbt of directTasks) {
             const taskIdStr = String(dbt.id);
             if (seen.has(taskIdStr)) continue;
             seen.add(taskIdStr);
+
+            // De-duplicate tasks with the same title and status to prevent double display
+            const statusKey = (dbt.status === "completed" || dbt.status === "Completed") ? "completed" : "active";
+            const normTitle = (dbt.title || "").trim().toLowerCase();
+            const sig = normTitle + "_" + statusKey + "_" + (dbt.project_id || "");
+            if (seenSignatures.has(sig)) continue;
+            seenSignatures.add(sig);
 
             const meta = (dbt.metadata && typeof dbt.metadata === "object") ? dbt.metadata : {};
             const durationHours = Number(dbt.duration) || (dbt.duration_minutes ? Number(dbt.duration_minutes) / 60 : 0);
