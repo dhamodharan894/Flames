@@ -578,20 +578,43 @@ export const updateAttendance = async (req, res) => {
 
     const { checkIn, checkOut, status, date } = req.body;
 
+    let existing = await query("SELECT * FROM attendance WHERE id = $1", [id]);
+    if (existing.rows.length === 0) {
+      existing = await query(
+        "SELECT * FROM attendance WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') ORDER BY date DESC, updated_at DESC LIMIT 1",
+        [id]
+      );
+    }
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "Attendance record not found." });
+    }
+    const targetAttId = existing.rows[0].id;
+    const targetUserId = existing.rows[0].user_id;
+
     const result = await query(
       `UPDATE attendance
        SET check_in = COALESCE($1, check_in),
            check_out = COALESCE($2, check_out),
            status = COALESCE($3, status),
            date = COALESCE($4, date),
+           is_admin_locked = CASE WHEN $3 = 'present' THEN FALSE ELSE is_admin_locked END,
+           penalty_status = CASE WHEN $3 = 'present' THEN NULL ELSE penalty_status END,
+           penalty_reason = CASE WHEN $3 = 'present' THEN NULL ELSE penalty_reason END,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $5
        RETURNING *`,
-      [checkIn || null, checkOut || null, status || null, date || null, id]
+      [checkIn || null, checkOut || null, status || null, date || null, targetAttId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Attendance record not found." });
+    }
+
+    if (status === 'present') {
+      await query(
+        "UPDATE tasks SET sla_penalty_applied = FALSE, updated_at = NOW() WHERE assigned_to = $1 AND sla_penalty_applied = TRUE",
+        [targetUserId]
+      ).catch(() => {});
     }
 
     const updatedRow = result.rows[0];
@@ -1442,7 +1465,13 @@ export const adminRevertPenalty = async (req, res) => {
       return res.status(403).json({ error: "Only an Admin or Superadmin can resolve compliance penalties and revert attendance." });
     }
 
-    const existingRes = await query("SELECT * FROM attendance WHERE id = $1", [id]);
+    let existingRes = await query("SELECT * FROM attendance WHERE id = $1", [id]);
+    if (existingRes.rows.length === 0) {
+      existingRes = await query(
+        "SELECT * FROM attendance WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') ORDER BY date DESC, updated_at DESC LIMIT 1",
+        [id]
+      );
+    }
     if (existingRes.rows.length === 0) {
       return res.status(404).json({ error: "Attendance record not found." });
     }
@@ -1458,7 +1487,7 @@ export const adminRevertPenalty = async (req, res) => {
            updated_at = NOW()
        WHERE id = $1
        RETURNING *`,
-      [id]
+      [record.id]
     );
 
     // Unblock the employee's tasks

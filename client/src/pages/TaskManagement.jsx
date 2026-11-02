@@ -913,7 +913,7 @@ export default function TaskManagement() {
                                 <button
                                   onClick={() => {
                                     setSelectedAttendanceRecord({
-                                      id: t.attendance_id || t.assigned_to,
+                                      id: t.attendance_id || t.attendanceId || t.assigned_to,
                                       userName: t.assignee_name || t.assigneeName,
                                       taskTitle: t.title
                                     });

@@ -11,6 +11,7 @@ export const getTasks = async (req, res) => {
       SELECT t.*, t.id as "_id", t.assigned_to as assignee_id, t.assigned_to as "assigneeId",
              u.name as assignee_name, u.name as "assigneeName", u.email as assignee_email,
              p.name as project_name, p.name as "projectName",
+             att.attendance_id, att.attendance_id as "attendanceId",
              att.status as employee_attendance_status,
              att.is_admin_locked as employee_is_admin_locked,
              att.penalty_status as employee_penalty_status,
@@ -20,7 +21,7 @@ export const getTasks = async (req, res) => {
       LEFT JOIN projects p ON t.project_id = p.id
       LEFT JOIN (
         SELECT DISTINCT ON (user_id) 
-          user_id, status, is_admin_locked, penalty_status, penalty_reason
+          id as attendance_id, user_id, status, is_admin_locked, penalty_status, penalty_reason
         FROM attendance 
         WHERE date >= CURRENT_DATE - INTERVAL '1 day'
         ORDER BY user_id, updated_at DESC
