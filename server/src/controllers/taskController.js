@@ -234,7 +234,6 @@ export const updateTask = async (req, res) => {
         `UPDATE tasks 
          SET sla_penalty_applied = FALSE, 
              overdue = FALSE, 
-             last_reported_at = NOW(),
              metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{deadlineTimestamp}', to_jsonb($2::text))
          WHERE id = $1`,
         [updatedTask.id, new Date(effectiveDl).toISOString()]
@@ -461,7 +460,6 @@ export const markTaskViewed = async (req, res) => {
         `UPDATE tasks 
          SET sla_penalty_applied = FALSE, 
              overdue = FALSE, 
-             last_reported_at = NOW(),
              metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{deadlineTimestamp}', to_jsonb($2::text))
          WHERE id = $1`,
         [updatedTask.id, new Date(effectiveDl).toISOString()]

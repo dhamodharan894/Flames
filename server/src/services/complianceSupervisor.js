@@ -217,10 +217,10 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
       const tz = await getCompanyTimezone(task.company_id);
       const today = getLocalDateInTz(tz);
 
-      // Find latest report for this employee & task today
+      // Find latest report for this employee & task today (isolated strictly per task)
       const repRes = await query(
         `SELECT created_at FROM hourly_reports 
-         WHERE user_id = $1 AND (task_id = $2 OR report_date = $3)
+         WHERE user_id = $1 AND task_id = $2 AND report_date = $3
          ORDER BY created_at DESC LIMIT 1`,
         [task.assigned_to, task.task_id, today]
       );
@@ -245,7 +245,7 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
 
       const baselineTime = latestReportMs > 0
         ? latestReportMs
-        : new Date(task.viewed_at || task.assigned_at || task.created_at).getTime();
+        : new Date(task.assigned_at || task.created_at).getTime();
 
       const elapsedMinutes = Math.floor((Date.now() - baselineTime) / (60 * 1000));
 

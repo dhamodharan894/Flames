@@ -384,9 +384,24 @@ export default function TaskManagement() {
 
       await submitHourlyReport(payload);
 
-      // Reset the 5-minute cycle to count fresh 5 minutes from now
+      // Reset the 5-minute cycle to count fresh 5 minutes from now for this specific task
       const todayStr = new Date().toISOString().split("T")[0];
-      localStorage.setItem(`hourly_cycle_${targetTaskId}_${todayStr}`, Date.now().toString());
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      try {
+        localStorage.setItem(`hourly_cycle_${targetTaskId}_${todayStr}`, nowMs.toString());
+      } catch (e) {}
+
+      // Update local task state immediately so only this task's timer is reset
+      setTasks(prev => prev.map(t => (t.id === targetTaskId ? {
+        ...t,
+        lastReportedAt: nowIso,
+        last_reported_at: nowIso,
+        slaPenaltyApplied: false,
+        sla_penalty_applied: false,
+        isAttendanceLocked: false,
+        attendanceStatus: "present"
+      } : t)));
 
       showToast("Progress report submitted successfully! Timer reset for 5 minutes.", "success");
       setShowHourlyReportModal(false);
@@ -504,7 +519,7 @@ export default function TaskManagement() {
     const sessionKey = `hourly_cycle_${task.id}_${todayStr}`;
     let baseTime = null;
 
-    // 1. If a report was submitted today for this task, count 5 mins from that report:
+    // 1. If a report was submitted today for this specific task, count 5 mins from that report:
     const lastReport = task.lastReportedAt || task.last_reported_at;
     if (lastReport) {
       const repTime = new Date(lastReport).getTime();
@@ -514,35 +529,32 @@ export default function TaskManagement() {
       }
     }
 
-    // 2. If task was updated / extended by admin, baseline from extension time
-    const extensionTime = (task.updatedAt || task.updated_at) ? new Date(task.updatedAt || task.updated_at).getTime() : 0;
-    if (extensionTime && (!baseTime || extensionTime > baseTime)) {
-      baseTime = extensionTime;
-      try { localStorage.setItem(sessionKey, extensionTime.toString()); } catch(e) {}
-    }
-
-    // 3. Fallback to session key stored time
+    // 2. Check localStorage if this specific task was submitted today in this browser session
     if (!baseTime) {
-      let stored = localStorage.getItem(sessionKey);
-      if (!stored) {
-        stored = Date.now().toString();
-        try { localStorage.setItem(sessionKey, stored); } catch(e) {}
+      const stored = localStorage.getItem(sessionKey);
+      if (stored) {
+        const storedTime = parseInt(stored, 10);
+        if (!isNaN(storedTime) && new Date().toDateString() === new Date(storedTime).toDateString()) {
+          baseTime = storedTime;
+        }
       }
-      baseTime = parseInt(stored, 10);
     }
 
-    // 4. If deadline is active (in the future) and attendance is not locked,
-    // ensure stale overdue local timers from before the extension are refreshed
-    const effectiveDl = getEffectiveDeadline(task);
-    const isFutureDeadline = effectiveDl && new Date(effectiveDl).getTime() > now;
-    if (isFutureDeadline && !task.isAttendanceLocked && task.attendanceStatus !== "absent") {
-      const totalElapsed = (now - baseTime) / 60000;
-      if (totalElapsed >= 10 && !lastReport) {
-        // Stale timer from earlier before extension: reset fresh to now
-        baseTime = now;
-        try { localStorage.setItem(sessionKey, now.toString()); } catch(e) {}
+    // 3. If task was explicitly extended by admin, baseline from extendedAt
+    const meta = (task.metadata && typeof task.metadata === 'object') ? task.metadata : {};
+    if (!baseTime && meta.extendedAt) {
+      baseTime = new Date(meta.extendedAt).getTime();
+    }
+
+    // 4. Fallback to this specific task's own assignment time
+    if (!baseTime) {
+      const assignTime = task.assignedAt || task.assigned_at || task.createdAt || task.created_at;
+      if (assignTime) {
+        baseTime = new Date(assignTime).getTime();
       }
     }
+
+    if (!baseTime || isNaN(baseTime)) return null;
 
     const nextDue = baseTime + 5 * 60 * 1000; // 5 minutes cycle
     const diff = nextDue - now;
