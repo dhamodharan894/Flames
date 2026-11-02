@@ -199,6 +199,7 @@ describe("Task SLA & Hourly Report Compliance Engine Test Suite", () => {
     const attId = "att_hourly_test_" + Date.now();
 
     // Ensure clean state for today
+    await query("DELETE FROM tasks WHERE company_id = $1", [testCompany]);
     await query("DELETE FROM hourly_reports WHERE user_id = $1 AND report_date = $2", [testEmp.id, today]);
     await query("DELETE FROM attendance WHERE user_id = $1 AND date = $2", [testEmp.id, today]);
 

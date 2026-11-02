@@ -492,6 +492,21 @@ export const completeTask = async (req, res) => {
     }
 
     const task = existingRes.rows[0];
+
+    // Block employee modifications if attendance is locked due to missed reports
+    if (req.user?.role !== "admin" && task.assigned_to) {
+      const attCheck = await query(
+        `SELECT is_admin_locked, status FROM attendance WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') AND is_admin_locked = TRUE LIMIT 1`,
+        [task.assigned_to]
+      );
+      if (attCheck.rows.length > 0 || task.sla_penalty_applied) {
+        return res.status(403).json({
+          error: "Task actions are locked: your attendance was marked Absent due to missing progress reports (> 10m). Please contact Admin to unlock.",
+          locked: true
+        });
+      }
+    }
+
     const now = new Date();
     let completionStatus = "completed_on_time";
 

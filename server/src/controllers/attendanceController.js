@@ -1461,6 +1461,12 @@ export const adminRevertPenalty = async (req, res) => {
       [id]
     );
 
+    // Unblock the employee's tasks
+    await query(
+      `UPDATE tasks SET sla_penalty_applied = FALSE, updated_at = NOW() WHERE assigned_to = $1 AND sla_penalty_applied = TRUE`,
+      [record.user_id]
+    ).catch(() => {});
+
     const updated = result.rows[0];
 
     const notifId = "notif_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
