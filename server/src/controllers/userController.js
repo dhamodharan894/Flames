@@ -274,6 +274,16 @@ export const updateUser = async (req, res) => {
               ).catch(() => {});
             }
           }
+
+          // If tasks were removed, delete them from tasks table so employee page reflects deletion immediately
+          if (currentTaskIds.length > 0) {
+            await query(
+              `DELETE FROM tasks WHERE assigned_to = $1 AND id NOT IN (${currentTaskIds.map((_, i) => `$${i + 2}`).join(", ")})`,
+              [id, ...currentTaskIds]
+            ).catch(err => console.error("Error removing deleted tasks:", err.message));
+          } else {
+            await query("DELETE FROM tasks WHERE assigned_to = $1", [id]).catch(() => {});
+          }
         }
       } catch (syncErr) {
         console.warn("Task table sync warning:", syncErr.message);

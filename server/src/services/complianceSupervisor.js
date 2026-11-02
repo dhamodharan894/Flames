@@ -31,10 +31,20 @@ export const getLocalDateInTz = (timeZone = "Asia/Kolkata") => {
   }
 };
 
+let isCheckingCompliance = false;
+
 export const checkComplianceNow = async (io = null, targetCompanyId = null) => {
-  const taskPenalties = await runTaskUnseenComplianceCheck(io, targetCompanyId);
-  const { remindersCount, penaltyCount } = await runHourlyReportingComplianceCheck(io, targetCompanyId);
-  return { taskPenalties, remindersCount, penaltyCount };
+  if (isCheckingCompliance) {
+    return { taskPenalties: 0, remindersCount: 0, penaltyCount: 0 };
+  }
+  isCheckingCompliance = true;
+  try {
+    const taskPenalties = await runTaskUnseenComplianceCheck(io, targetCompanyId);
+    const { remindersCount, penaltyCount } = await runHourlyReportingComplianceCheck(io, targetCompanyId);
+    return { taskPenalties, remindersCount, penaltyCount };
+  } finally {
+    isCheckingCompliance = false;
+  }
 };
 
 /**
@@ -550,8 +560,8 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
 /**
  * Start the background compliance supervisor daemon
  */
-export const startComplianceSupervisor = (io, intervalMs = 30000) => {
-  console.log("🛡️ [ComplianceSupervisor] Task & Progress Reporting SLA Supervisor started (30s tick).");
+export const startComplianceSupervisor = (io, intervalMs = 60000) => {
+  console.log("🛡️ [ComplianceSupervisor] Task & Progress Reporting SLA Supervisor started (60s tick).");
 
   // Initial immediate check
   setTimeout(() => {

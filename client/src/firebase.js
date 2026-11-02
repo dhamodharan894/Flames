@@ -758,6 +758,13 @@ export const updateTask = async (taskId, updates) => {
 };
 
 export const deleteTask = async (taskId) => {
+  try {
+    const cur = JSON.parse(localStorage.getItem("att_current_user") || "null");
+    if (cur && Array.isArray(cur.tasks)) {
+      cur.tasks = cur.tasks.filter(t => String(t.id) !== String(taskId));
+      localStorage.setItem("att_current_user", JSON.stringify(cur));
+    }
+  } catch {}
   return apiFetch(`/tasks/${taskId}`, { method: "DELETE" });
 };
 
@@ -1001,8 +1008,8 @@ export const subscribeToUserTasks = (userId, callback) => {
         // Fallback if network blip
       }
 
-      // 2. Fallback to direct user embedded tasks
-      if (tasks === null || tasks.length === 0) {
+      // 2. Fallback to direct user embedded tasks only if network error occurred
+      if (tasks === null) {
         try {
           const user = await apiFetch(`/users/${userId}`);
           if (user && Array.isArray(user.tasks) && user.tasks.length > 0) {

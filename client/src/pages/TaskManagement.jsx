@@ -21,6 +21,7 @@ import {
   getHourlyReports,
   revertAttendancePenalty,
   assignTask,
+  deleteTask,
   fetchAllTasks,
   subscribeToAllUsers,
   uploadFileToFirebase
@@ -332,6 +333,21 @@ export default function TaskManagement() {
     }
   };
 
+  // Admin: Delete Task
+  const handleDeleteAdminTask = async (task) => {
+    if (!window.confirm(`Are you sure you want to delete the task "${task.title}"? This will permanently remove the task for the assigned employee.`)) {
+      return;
+    }
+    try {
+      await deleteTask(task.id);
+      showToast("Task deleted successfully.", "success");
+      refreshAdminTasks();
+    } catch (err) {
+      console.error("Delete task error:", err);
+      showToast("Failed to delete task.", "error");
+    }
+  };
+
   // Employee: Submit Hourly Progress Report
   const handleHourlyReportSubmit = async (e) => {
     e.preventDefault();
@@ -426,13 +442,15 @@ export default function TaskManagement() {
           ? "Task completed on time! Excellent job." 
           : "Task marked completed (overdue SLA recorded).";
         showToast(statusMsg, res.completion_status === "completed_on_time" ? "success" : "info");
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, completed: true, status: "completed", completionStatus: res.completion_status } : t));
       } else {
         await updateTaskStatus(task.id, "pending", currentUser.uid);
         showToast("Task marked as in progress.", "info");
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, completed: false, status: "pending" } : t));
       }
     } catch (err) {
       console.error("Complete Task error:", err);
-      showToast("Failed to update task status.", "error");
+      showToast(err.message || "Failed to update task status.", "error");
     }
   };
 
@@ -869,23 +887,32 @@ export default function TaskManagement() {
 
                           {/* Actions */}
                           <td className="py-3.5 px-4 text-right">
-                            {isAbsent && isLocked && (
+                            <div className="flex items-center justify-end gap-2">
+                              {isAbsent && isLocked && (
+                                <button
+                                  onClick={() => {
+                                    setSelectedAttendanceRecord({
+                                      id: t.attendance_id || t.assigned_to,
+                                      userName: t.assignee_name || t.assigneeName,
+                                      taskTitle: t.title
+                                    });
+                                    setShowRevertModal(true);
+                                  }}
+                                  className="inline-flex items-center gap-1 bg-red-500/10 text-red-600 hover:bg-red-500 hover:text-white px-2.5 py-1.5 rounded-[8px] font-bold text-xs transition-colors cursor-pointer"
+                                  title="Admin override: restore attendance to Present"
+                                >
+                                  <Unlock size={12} />
+                                  Unlock / Revert
+                                </button>
+                              )}
                               <button
-                                onClick={() => {
-                                  setSelectedAttendanceRecord({
-                                    id: t.attendance_id || t.assigned_to,
-                                    userName: t.assignee_name || t.assigneeName,
-                                    taskTitle: t.title
-                                  });
-                                  setShowRevertModal(true);
-                                }}
-                                className="inline-flex items-center gap-1 bg-red-500/10 text-red-600 hover:bg-red-500 hover:text-white px-2.5 py-1.5 rounded-[8px] font-bold text-xs transition-colors cursor-pointer"
-                                title="Admin override: restore attendance to Present"
+                                onClick={() => handleDeleteAdminTask(t)}
+                                className="p-1.5 text-text-mut hover:text-red-500 hover:bg-red-500/10 rounded-[8px] transition-colors cursor-pointer"
+                                title="Delete Task"
                               >
-                                <Unlock size={12} />
-                                Unlock / Revert
+                                <Trash2 size={14} />
                               </button>
-                            )}
+                            </div>
                           </td>
                         </tr>
                       );

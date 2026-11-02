@@ -19,7 +19,8 @@ import {
   updateUserTasks,
   updateUserProjects,
   updateUserRecord,
-  assignTask
+  assignTask,
+  deleteTask
 } from "../firebase";
 import { useModal } from "../context/ModalContext";
 import { Search, Plus, Calendar, Clock, Edit2, Trash2, CheckCircle, XCircle, ChevronRight, UserPlus, Users, X, FileText, Download, MessageSquare, Briefcase, Sparkles, Zap, Eye, AlertCircle } from "lucide-react";
@@ -1465,12 +1466,17 @@ export default function ProjectManagement() {
 
   const handleDeleteTask = async (taskIdx) => {
     showConfirm("Delete Task", "Are you sure you want to delete this task?", async () => {
-      let currentTasks = taskTargetUser.tasks || [];
+      let currentTasks = [...(taskTargetUser.tasks || [])];
+      const taskToDelete = currentTasks[taskIdx];
       currentTasks.splice(taskIdx, 1);
       
       try {
         await updateUserTasks(taskTargetUser.uid, currentTasks);
-        showToast("Task deleted", "success");
+        if (taskToDelete?.id) {
+          await deleteTask(taskToDelete.id).catch(() => {});
+        }
+        setTaskTargetUser(prev => prev ? { ...prev, tasks: currentTasks } : null);
+        showToast("Task deleted successfully", "success");
       } catch (err) {
         showToast("Failed to delete task", "error");
       }

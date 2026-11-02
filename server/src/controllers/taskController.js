@@ -267,13 +267,40 @@ export const updateTask = async (req, res) => {
 export const deleteTask = async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await query("DELETE FROM tasks WHERE id = $1 RETURNING id", [id]);
-    if (result.rows.length === 0) {
+    const existing = await query("SELECT * FROM tasks WHERE id = $1", [id]);
+    if (existing.rows.length === 0) {
       return res.status(404).json({ error: "Task not found." });
     }
+    const task = existing.rows[0];
+
+    await query("DELETE FROM tasks WHERE id = $1", [id]);
+
+    // Also remove from user's metadata.tasks array if present
+    if (task.assigned_to) {
+      await query(
+        `UPDATE users
+         SET metadata = jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{tasks}',
+           (
+             SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+             FROM jsonb_array_elements(COALESCE(metadata->'tasks', '[]'::jsonb)) elem
+             WHERE elem->>'id' <> $1
+           )
+         )
+         WHERE id = $2 AND metadata->'tasks' IS NOT NULL`,
+        [id, task.assigned_to]
+      ).catch(() => {});
+    }
+
+    // Also remove related hourly and task reports
+    await query("DELETE FROM hourly_reports WHERE task_id = $1", [id]).catch(() => {});
+    await query("DELETE FROM task_reports WHERE task_id = $1", [id]).catch(() => {});
 
     const io = req.app?.get("io");
     if (io) {
+      if (task.company_id) io.to(`company_${task.company_id}`).emit("task_deleted", { id });
+      if (task.assigned_to) io.to(`user_${task.assigned_to}`).emit("task_deleted", { id });
       io.emit("task_deleted", { id });
     }
 
@@ -471,21 +498,16 @@ export const completeTask = async (req, res) => {
     let completionStatus = "completed_on_time";
 
     const meta = (task.metadata && typeof task.metadata === "object") ? task.metadata : {};
-    const exactDeadline = meta.deadlineTimestamp 
-      ? new Date(meta.deadlineTimestamp) 
-      : (task.deadline ? new Date(task.deadline) : (task.due_date ? new Date(task.due_date) : null));
+    const candidateDeadlines = [
+      task.deadline ? new Date(task.deadline).getTime() : 0,
+      task.due_date ? new Date(task.due_date).getTime() : 0,
+      meta.deadlineTimestamp ? new Date(meta.deadlineTimestamp).getTime() : 0
+    ].filter(ts => ts > 0 && !isNaN(ts));
+    const exactDeadline = candidateDeadlines.length > 0 ? new Date(Math.max(...candidateDeadlines)) : null;
 
     if (exactDeadline && !isNaN(exactDeadline.getTime())) {
-      if (meta.deadlineTimestamp && typeof meta.deadlineTimestamp === "string" && meta.deadlineTimestamp.includes("T")) {
-        if (now.getTime() > exactDeadline.getTime()) {
-          completionStatus = "completed_overdue";
-        }
-      } else {
-        const endOfDay = new Date(exactDeadline);
-        endOfDay.setUTCHours(23, 59, 59, 999);
-        if (now.getTime() > endOfDay.getTime()) {
-          completionStatus = "completed_overdue";
-        }
+      if (now.getTime() > exactDeadline.getTime()) {
+        completionStatus = "completed_overdue";
       }
     }
 
@@ -498,11 +520,31 @@ export const completeTask = async (req, res) => {
        SET status = 'completed',
            completion_status = $1,
            metadata = $2,
+           completed_at = NOW(),
            updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
       [completionStatus, JSON.stringify(meta), id]
     );
+
+    // Also sync completion state to user's metadata.tasks array
+    if (task.assigned_to) {
+      await query(
+        `UPDATE users
+         SET metadata = jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{tasks}',
+           (
+             SELECT jsonb_agg(
+               CASE WHEN elem->>'id' = $1 THEN jsonb_set(elem, '{completed}', 'true'::jsonb) ELSE elem END
+             )
+             FROM jsonb_array_elements(COALESCE(metadata->'tasks', '[]'::jsonb)) elem
+           )
+         )
+         WHERE id = $2 AND metadata->'tasks' IS NOT NULL`,
+        [id, task.assigned_to]
+      ).catch(() => {});
+    }
 
     const completedTask = result.rows[0];
     const io = req.app?.get("io");

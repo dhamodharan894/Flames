@@ -53,6 +53,6 @@ __pycache__/
 /*.md
 
 
+face_service/.venv/
 .venv/
 venv/
-face_service/.venv/
