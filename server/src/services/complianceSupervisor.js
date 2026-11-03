@@ -102,6 +102,7 @@ export const runTaskUnseenComplianceCheck = async (io = null, targetCompanyId = 
         await query(
           `UPDATE attendance
            SET status = 'absent',
+               check_out = COALESCE(check_out, NOW()),
                penalty_status = 'unseen_task_penalty',
                is_admin_locked = TRUE,
                penalty_applied_at = NOW(),
@@ -241,9 +242,17 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
         }
       }
 
-      const latestReportMs = repRes.rows.length > 0
+      const repTime = repRes.rows.length > 0
         ? new Date(repRes.rows[0].created_at).getTime()
-        : (task.last_reported_at ? new Date(task.last_reported_at).getTime() : 0);
+        : 0;
+      const lastReportedTime = task.last_reported_at
+        ? new Date(task.last_reported_at).getTime()
+        : 0;
+      const unlockTime = meta.unlockedAt
+        ? new Date(meta.unlockedAt).getTime()
+        : 0;
+
+      const latestReportMs = Math.max(repTime, lastReportedTime, unlockTime);
 
       const baselineTime = latestReportMs > 0
         ? latestReportMs
@@ -320,14 +329,20 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
             await query(
               `UPDATE attendance
                SET status = 'absent',
-                   penalty_status = 'missed_hourly_report_penalty',
+                   check_out = COALESCE(check_out, NOW()),
+                   penalty_status = COALESCE(penalty_status, 'missed_hourly_report_penalty'),
                    is_admin_locked = TRUE,
                    penalty_applied_at = NOW(),
-                   penalty_reason = $1,
-                   penalized_by_task_id = $2,
+                   penalty_reason = COALESCE(penalty_reason, $1),
+                   penalized_by_task_id = COALESCE(penalized_by_task_id, $2),
                    updated_at = NOW()
                WHERE id = $3`,
               [penaltyReason, task.task_id, attId]
+            );
+          } else if (!attRecord.check_out) {
+            await query(
+              `UPDATE attendance SET check_out = NOW(), updated_at = NOW() WHERE id = $1`,
+              [attId]
             );
           }
         } else {
@@ -335,11 +350,11 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
           attId = "att_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
           await query(
             `INSERT INTO attendance (
-              id, user_id, company_id, date, status, penalty_status,
+              id, user_id, company_id, date, status, check_out, penalty_status,
               is_admin_locked, penalty_applied_at, penalty_reason, penalized_by_task_id,
               created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, 'absent', 'missed_hourly_report_penalty', TRUE, NOW(), $5, $6, NOW(), NOW())`,
+            VALUES ($1, $2, $3, $4, 'absent', NOW(), 'missed_hourly_report_penalty', TRUE, NOW(), $5, $6, NOW(), NOW())`,
             [attId, task.assigned_to, task.company_id, today, penaltyReason, task.task_id]
           );
         }
@@ -499,10 +514,11 @@ export const runHourlyReportingComplianceCheck = async (io = null, targetCompany
         penalizedUsers.add(record.user_id);
         const penaltyReason = `Missed required progress report for ${elapsedMinutes} minutes (exceeded 10-minute limit).`;
 
-        // Update attendance to Absent and Lock reporting
+        // Update attendance to Absent and Lock reporting, auto checkout
         await query(
           `UPDATE attendance
            SET status = 'absent',
+               check_out = COALESCE(check_out, NOW()),
                penalty_status = 'missed_hourly_report_penalty',
                is_admin_locked = TRUE,
                penalty_applied_at = NOW(),

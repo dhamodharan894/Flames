@@ -139,9 +139,27 @@ export default function History() {
     }
   };
 
+  // Helper: compute working minutes with robust fallback across formats
+  const getLogWorkingMinutes = (log) => {
+    if (!log) return 0;
+    if (typeof log.totalWorkingMinutes === "number" && log.totalWorkingMinutes > 0) return log.totalWorkingMinutes;
+    if (typeof log.durationMinutes === "number" && log.durationMinutes > 0) return log.durationMinutes;
+    if (typeof log.duration_minutes === "number" && log.duration_minutes > 0) return log.duration_minutes;
+    if (log.totalHours && !isNaN(parseFloat(log.totalHours)) && parseFloat(log.totalHours) > 0) {
+      return Math.round(parseFloat(log.totalHours) * 60);
+    }
+    const inTime = log.checkInTime || log.check_in;
+    const outTime = log.checkOutTime || log.check_out;
+    if (inTime && outTime) {
+      const diff = Math.max(0, Math.floor((new Date(outTime) - new Date(inTime)) / 60000));
+      if (diff > 0 && diff < 24 * 60) return diff;
+    }
+    return 0;
+  };
+
   // Compute summary stats
   const totalDays = filteredLogs.length;
-  const totalHours = filteredLogs.reduce((acc, log) => acc + (log.totalWorkingMinutes || 0), 0) / 60;
+  const totalHours = filteredLogs.reduce((acc, log) => acc + getLogWorkingMinutes(log), 0) / 60;
   const avgHours = totalDays > 0 ? totalHours / totalDays : 0;
   const shortBreaks = filteredLogs.reduce((acc, log) => {
     const count = log.breaks?.filter(b => b.type === "short").length || 0;
@@ -154,7 +172,8 @@ export default function History() {
 
   // Hourly stats for last 7 logged days
   const chartData = [...filteredLogs].reverse().slice(-7).map(log => {
-    const hrs = parseFloat(((log.totalWorkingMinutes || 0) / 60).toFixed(1));
+    const mins = getLogWorkingMinutes(log);
+    const hrs = parseFloat((mins / 60).toFixed(1));
     const formattedDate = new Date(log.date).toLocaleDateString([], { month: "short", day: "numeric" });
     return { dateLabel: formattedDate, hours: hrs };
   });
@@ -170,7 +189,8 @@ export default function History() {
     const startY = await addStandardPDFHeader(doc, titleText, subtitleText);
 
     const tableData = filteredLogs.map((log) => {
-      const workingHours = log.totalWorkingMinutes ? (log.totalWorkingMinutes / 60).toFixed(1) + " hrs" : "—";
+      const mins = getLogWorkingMinutes(log);
+      const workingHours = mins > 0 ? (mins / 60).toFixed(1) + " hrs" : "—";
       return [
         log.date,
         log.checkInTime || "—",
@@ -223,13 +243,16 @@ export default function History() {
   const handleDownloadExcel = () => {
     if (filteredLogs.length === 0) return showToast("No logs available to download.", "warning");
     
-    const excelData = filteredLogs.map((log) => ({
-      "Date": log.date,
-      "Check In": log.checkInTime || "-",
-      "Check Out": log.checkOutTime || "-",
-      "Working Hours": log.totalWorkingMinutes ? (log.totalWorkingMinutes / 60).toFixed(1) + " hrs" : "-",
-      "Status": log.status || "Present",
-    }));
+    const excelData = filteredLogs.map((log) => {
+      const mins = getLogWorkingMinutes(log);
+      return {
+        "Date": log.date,
+        "Check In": log.checkInTime || log.checkIn || "-",
+        "Check Out": log.checkOutTime || log.checkOut || "-",
+        "Working Hours": mins > 0 ? (mins / 60).toFixed(1) + " hrs" : "-",
+        "Status": log.status || "Present",
+      };
+    });
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
     const workbook = XLSX.utils.book_new();
@@ -357,20 +380,24 @@ export default function History() {
           </h3>
           <p className="text-[10px] text-text-mut font-semibold mb-6">Visual tracking of completed shift hours per logged day</p>
           
-          <div className="flex items-end justify-around h-[180px] border-b border-border-card pb-2 pt-6 px-4">
+          <div className="flex items-end justify-around h-[190px] border-b border-border-card pb-2 pt-6 px-4">
             {chartData.map((c, idx) => {
-              const barHeight = Math.max(10, Math.round((c.hours / maxChartHours) * 100));
+              const barHeight = c.hours > 0 ? Math.max(14, Math.round((c.hours / maxChartHours) * 100)) : 6;
               return (
-                <div key={idx} className="flex flex-col items-center justify-end gap-2 group w-12 h-full">
+                <div key={idx} className="flex flex-col items-center justify-end gap-1.5 group w-14 h-full">
                   <div className="opacity-0 group-hover:opacity-100 absolute transform -translate-y-12 z-10 bg-slate-900 text-white text-[9px] font-extrabold px-1.5 py-0.5 rounded shadow pointer-events-none transition-opacity duration-150">
                     {c.hours} hours
                   </div>
                   
+                  <span className="text-[10px] font-bold text-brand-primary tracking-tight">
+                    {c.hours > 0 ? `${c.hours}h` : "0h"}
+                  </span>
+
                   <div 
-                    className="w-5 rounded-t-sm bg-brand-primary hover:bg-brand-hover transition-all duration-300 relative overflow-hidden"
+                    className="w-6 rounded-t-[6px] bg-brand-primary hover:bg-brand-hover transition-all duration-300 relative overflow-hidden"
                     style={{ height: `${barHeight}%` }}
                   >
-                    <div className="absolute inset-x-0 top-0 h-0.5 bg-white/10" />
+                    <div className="absolute inset-x-0 top-0 h-1 bg-white/20" />
                   </div>
                   
                   <span className="text-[10px] font-bold text-text-sec tracking-tight text-center">{c.dateLabel}</span>
@@ -549,8 +576,8 @@ export default function History() {
                                   )}
                                 </td>
                                 <td className="py-3.5 px-4">
-                                  <div className="font-bold text-brand-primary">{(log.totalWorkingMinutes / 60).toFixed(2)} hrs</div>
-                                  <span className="text-[10px] text-text-mut">{log.totalWorkingMinutes} mins</span>
+                                  <div className="font-bold text-brand-primary">{(getLogWorkingMinutes(log) / 60).toFixed(2)} hrs</div>
+                                  <span className="text-[10px] text-text-mut">{getLogWorkingMinutes(log)} mins</span>
                                 </td>
                                 <td className="py-3.5 pl-4 text-right">
                                   {log.status === "checked-in" && <span className="bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 text-[9px] px-2 py-0.5 rounded-full font-bold uppercase">Working</span>}

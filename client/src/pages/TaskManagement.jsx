@@ -251,10 +251,11 @@ export default function TaskManagement() {
       return (now - assigned) > 60 * 60 * 1000;
     }).length;
 
-    // Penalized employees count
-    const penalizedEmployees = adminAllTasks.filter(t => 
-      t.employee_attendance_status === "absent" && t.employee_is_admin_locked
-    ).length;
+    // Penalized tasks count
+    const penalizedEmployees = adminAllTasks.filter(t => {
+      const nr = getNextReportDue(t);
+      return Boolean(t.sla_penalty_applied || t.slaPenaltyApplied || (nr && nr.isLocked));
+    }).length;
 
     return {
       total,
@@ -277,7 +278,10 @@ export default function TaskManagement() {
           const dl = t.deadline || t.metadata?.deadlineTimestamp || t.due_date;
           if (!dl || new Date(dl).getTime() >= now || t.status === "completed") return false;
         }
-        if (statusFilter === "penalized" && !(t.employee_attendance_status === "absent" && t.employee_is_admin_locked)) return false;
+        if (statusFilter === "penalized") {
+          const nr = getNextReportDue(t);
+          if (!Boolean(t.sla_penalty_applied || t.slaPenaltyApplied || (nr && nr.isLocked))) return false;
+        }
       }
       if (assigneeFilter !== "all" && t.assigned_to !== assigneeFilter) return false;
       if (searchQuery.trim()) {
@@ -426,7 +430,7 @@ export default function TaskManagement() {
 
     setSubmitting(true);
     try {
-      await revertAttendancePenalty(selectedAttendanceRecord.id, revertNotes);
+      await revertAttendancePenalty(selectedAttendanceRecord.id, revertNotes, selectedAttendanceRecord.taskId);
       showToast("Attendance penalty successfully reverted! Employee restored to Present.", "success");
       setShowRevertModal(false);
       setSelectedAttendanceRecord(null);
@@ -540,10 +544,13 @@ export default function TaskManagement() {
       }
     }
 
-    // 3. If task was explicitly extended by admin, baseline from extendedAt
+    // 3. If task was explicitly unlocked or extended by admin, baseline from that timestamp
     const meta = (task.metadata && typeof task.metadata === 'object') ? task.metadata : {};
-    if (!baseTime && meta.extendedAt) {
-      baseTime = new Date(meta.extendedAt).getTime();
+    const unlockTime = meta.unlockedAt ? new Date(meta.unlockedAt).getTime() : 0;
+    const extendTime = meta.extendedAt ? new Date(meta.extendedAt).getTime() : 0;
+    const adminActionTime = Math.max(unlockTime, extendTime);
+    if (adminActionTime > 0 && (!baseTime || adminActionTime > baseTime)) {
+      baseTime = adminActionTime;
     }
 
     // 4. Fallback to this specific task's own assignment time
@@ -559,11 +566,19 @@ export default function TaskManagement() {
     const nextDue = baseTime + 5 * 60 * 1000; // 5 minutes cycle
     const diff = nextDue - now;
 
+    const isRecordLocked = Boolean(
+      task.slaPenaltyApplied ||
+      task.sla_penalty_applied
+    );
+
+    if (isRecordLocked) {
+      return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
+    }
+
     if (diff <= 0) {
       const overdueMins = Math.floor(Math.abs(diff) / 60000);
-      const totalElapsedMins = Math.floor((now - baseTime) / 60000);
-      if (totalElapsedMins >= 10 || task.isAttendanceLocked || task.attendanceStatus === "absent" || task.slaPenaltyApplied || task.sla_penalty_applied) {
-        return { isOverdue: true, isLocked: true, text: "Locked (> 10m without report - Absent)" };
+      if (overdueMins >= 5) {
+        return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
       }
       return { isOverdue: true, isLocked: false, text: `Report overdue by ${overdueMins}m` };
     }
@@ -606,17 +621,12 @@ export default function TaskManagement() {
           {!isAdmin && (
             <button
               onClick={() => {
-                const isAnyPenalized = tasks.some(t => !t.completed && (
-                  (t.attendanceStatus === "absent" && t.isAttendanceLocked) ||
-                  t.slaPenaltyApplied ||
-                  t.sla_penalty_applied
-                ));
-                if (isAnyPenalized) {
-                  showToast("Reporting is locked: your attendance was marked Absent due to missing reports (> 10m). Please contact Admin to unlock.", "warning");
+                const unpenalizedTasks = tasks.filter(t => !t.completed && !t.slaPenaltyApplied && !t.sla_penalty_applied);
+                if (unpenalizedTasks.length === 0 && tasks.some(t => !t.completed)) {
+                  showToast("Reporting is locked: all active tasks have missed reports (> 10m). Please contact Admin to unlock.", "warning");
                   return;
                 }
-                const availableTasks = tasks.filter(t => {
-                  if (t.completed) return false;
+                const availableTasks = unpenalizedTasks.filter(t => {
                   const dl = getEffectiveDeadline(t);
                   return !(dl && new Date(dl).getTime() < Date.now());
                 });
@@ -818,8 +828,9 @@ export default function TaskManagement() {
                       const effectiveDeadline = getEffectiveDeadline(t);
                       const countdown = formatCountdown(effectiveDeadline);
                       const isUnviewedSlaViolated = !t.viewed_at && !t.viewedAt && (now - new Date(t.assigned_at || t.created_at).getTime()) > 60 * 60 * 1000;
-                      const isAbsent = t.employee_attendance_status === "absent";
-                      const isLocked = Boolean(t.employee_is_admin_locked);
+                      const nextReport = getNextReportDue(t);
+                      const isAbsent = Boolean(t.sla_penalty_applied || t.slaPenaltyApplied || (nextReport && nextReport.isLocked));
+                      const isLocked = isAbsent;
 
                       return (
                         <tr key={t.id} className="hover:bg-bg-base/30 transition-colors">
@@ -915,7 +926,8 @@ export default function TaskManagement() {
                                     setSelectedAttendanceRecord({
                                       id: t.attendance_id || t.attendanceId || t.assigned_to,
                                       userName: t.assignee_name || t.assigneeName,
-                                      taskTitle: t.title
+                                      taskTitle: t.title,
+                                      taskId: t.id
                                     });
                                     setShowRevertModal(true);
                                   }}
@@ -985,7 +997,6 @@ export default function TaskManagement() {
                     const nextReport = getNextReportDue(task);
                     const isNew = task.status === "new" || (!task.viewed_at && !task.viewedAt);
                     const isPenalized = Boolean(
-                      (task.attendanceStatus === "absent" && task.isAttendanceLocked) ||
                       task.slaPenaltyApplied ||
                       task.sla_penalty_applied ||
                       (nextReport && nextReport.isLocked)

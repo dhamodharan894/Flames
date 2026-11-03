@@ -62,7 +62,25 @@ export const getAttendance = async (req, res) => {
       const checkOutDate = row.check_out ? new Date(row.check_out) : null;
       const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
       
-      const durationHours = row.duration_minutes ? (row.duration_minutes / 60).toFixed(1) : (row.check_out ? "0.0" : "Live");
+      let totalBreakMinutes = 0;
+      if (Array.isArray(row.breaks)) {
+        row.breaks.forEach(b => {
+          if (b.start && b.end) {
+            totalBreakMinutes += Math.max(0, Math.floor((new Date(b.end) - new Date(b.start)) / 60000));
+          }
+        });
+      }
+
+      let workingMinutes = Number(row.duration_minutes) || 0;
+      if (!workingMinutes && checkInDate) {
+        const endTime = checkOutDate || new Date();
+        const rawMins = Math.max(0, Math.floor((endTime - checkInDate) / 60000));
+        if (rawMins > 0 && rawMins < 24 * 60) {
+          workingMinutes = Math.max(0, rawMins - totalBreakMinutes);
+        }
+      }
+
+      const durationHours = workingMinutes > 0 ? (workingMinutes / 60).toFixed(1) : (row.check_out ? "0.0" : "Live");
       const dateStr = row.date_str || (row.date instanceof Date ? row.date.toISOString().split("T")[0] : (row.date ? String(row.date).split("T")[0] : ""));
 
       let frontendStatus = "not-checked-in";
@@ -94,6 +112,10 @@ export const getAttendance = async (req, res) => {
         checkOutTime: row.check_out,
         checkInLocation: row.check_in_location || row.location,
         checkOutLocation: row.check_out_location,
+        duration_minutes: workingMinutes,
+        durationMinutes: workingMinutes,
+        totalWorkingMinutes: workingMinutes,
+        workingDuration: workingMinutes,
         totalHours: durationHours,
         status: frontendStatus,
         currentBreakTimerEnd
@@ -301,7 +323,8 @@ export const checkOut = async (req, res) => {
         durationMinutes = Math.max(0, rawElapsed - totalBreakMinutes);
       }
 
-      const checkoutStatus = durationMinutes < 240 ? "half-day" : "present";
+      const isAbsentPenalized = Boolean(rowData.is_admin_locked || rowData.status === "absent" || rowData.penalty_status);
+      const checkoutStatus = isAbsentPenalized ? "absent" : (durationMinutes < 240 ? "half-day" : "present");
 
       const result = await client.query(
         `UPDATE attendance
@@ -1457,7 +1480,7 @@ export const createVerificationSession = async (req, res) => {
 export const adminRevertPenalty = async (req, res) => {
   try {
     const { id } = req.params;
-    const { resolutionNotes = "" } = req.body || {};
+    const { resolutionNotes = "", taskId = null } = req.body || {};
     const adminId = req.user?.id;
     const userRole = (req.user?.role || "").toLowerCase();
 
@@ -1478,25 +1501,94 @@ export const adminRevertPenalty = async (req, res) => {
 
     const record = existingRes.rows[0];
 
-    const result = await query(
-      `UPDATE attendance
-       SET status = 'present',
-           is_admin_locked = FALSE,
-           penalty_status = NULL,
-           penalty_reason = NULL,
-           updated_at = NOW()
-       WHERE id = $1
-       RETURNING *`,
-      [record.id]
-    );
+    // If taskId is provided, unlock ONLY that specific task!
+    let updatedTasks = [];
+    let remainingPenalized = { rows: [] };
+    let updatedAttendance = null;
 
-    // Unblock the employee's tasks
-    await query(
-      `UPDATE tasks SET sla_penalty_applied = FALSE, updated_at = NOW() WHERE assigned_to = $1 AND sla_penalty_applied = TRUE`,
-      [record.user_id]
-    ).catch(() => {});
+    if (taskId) {
+      const nowIso = new Date().toISOString();
+      const tRes = await query(
+        `UPDATE tasks 
+         SET sla_penalty_applied = FALSE, 
+             last_reported_at = NOW(), 
+             updated_at = NOW(),
+             metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{unlockedAt}', to_jsonb($2::text))
+         WHERE id = $1 
+         RETURNING *`,
+        [taskId, nowIso]
+      );
+      updatedTasks = tRes.rows || [];
 
-    const updated = result.rows[0];
+      // Check if there are any other active tasks of this employee that remain penalized
+      remainingPenalized = await query(
+        `SELECT id, title FROM tasks 
+         WHERE assigned_to = $1 
+           AND status NOT IN ('completed', 'cancelled', 'suspended')
+           AND sla_penalty_applied = TRUE 
+           AND id != $2`,
+        [record.user_id, taskId]
+      );
+
+      if (remainingPenalized.rows.length === 0) {
+        // All active tasks are clear; restore attendance to Present
+        const attRes = await query(
+          `UPDATE attendance
+           SET status = 'present',
+               is_admin_locked = FALSE,
+               penalty_status = NULL,
+               penalty_reason = NULL,
+               penalized_by_task_id = NULL,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [record.id]
+        );
+        updatedAttendance = attRes.rows[0];
+      } else {
+        // Other tasks still penalized; keep attendance marked absent referencing the remaining task
+        const nextTask = remainingPenalized.rows[0];
+        const attRes = await query(
+          `UPDATE attendance
+           SET penalty_reason = $1,
+               penalized_by_task_id = $2,
+               updated_at = NOW()
+           WHERE id = $3
+           RETURNING *`,
+          [`Missed required progress report on task "${nextTask.title}" for > 10 minutes (exceeded 10-minute limit).`, nextTask.id, record.id]
+        );
+        updatedAttendance = attRes.rows[0];
+      }
+    } else {
+      const allRes = await query(
+        `UPDATE tasks 
+         SET sla_penalty_applied = FALSE, 
+             last_reported_at = NOW(), 
+             updated_at = NOW(),
+             metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{unlockedAt}', to_jsonb(NOW()::text))
+         WHERE assigned_to = $1 
+           AND status NOT IN ('completed', 'cancelled', 'suspended')
+         RETURNING *`,
+        [record.user_id]
+      ).catch(() => ({ rows: [] }));
+      if (allRes?.rows) updatedTasks = allRes.rows;
+
+      const attRes = await query(
+        `UPDATE attendance
+         SET status = 'present',
+             is_admin_locked = FALSE,
+             penalty_status = NULL,
+             penalty_reason = NULL,
+             penalized_by_task_id = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [record.id]
+      );
+      updatedAttendance = attRes.rows[0];
+    }
+
+    const updated = updatedAttendance || record;
 
     const notifId = "notif_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
     await query(
@@ -1512,16 +1604,43 @@ export const adminRevertPenalty = async (req, res) => {
 
     const io = req.app?.get("io");
     if (io) {
+      const isRestored = updated.status === "present";
       const payload = {
         attendanceId: id,
         userId: record.user_id,
-        status: "present",
-        is_admin_locked: false,
-        resolutionNotes
+        status: updated.status,
+        is_admin_locked: updated.is_admin_locked,
+        resolutionNotes,
+        updatedTasks: updatedTasks.map(t => ({
+          id: t.id,
+          slaPenaltyApplied: false,
+          sla_penalty_applied: false,
+          lastReportedAt: t.last_reported_at,
+          last_reported_at: t.last_reported_at,
+          attendanceStatus: updated.status,
+          isAttendanceLocked: updated.is_admin_locked
+        }))
       };
       io.to(`user_${record.user_id}`).emit("attendance_penalty_reverted", payload);
       if (record.company_id) io.to(`company_${record.company_id}`).emit("attendance_penalty_reverted", payload);
       io.emit("attendance_penalty_reverted", payload);
+
+      // Also emit individual task updates
+      for (const t of updatedTasks) {
+        const tPayload = {
+          id: t.id,
+          sla_penalty_applied: false,
+          slaPenaltyApplied: false,
+          last_reported_at: t.last_reported_at,
+          lastReportedAt: t.last_reported_at,
+          employee_attendance_status: updated.status,
+          employee_is_admin_locked: updated.is_admin_locked,
+          attendanceStatus: updated.status,
+          isAttendanceLocked: updated.is_admin_locked
+        };
+        io.to(`user_${record.user_id}`).emit("task_updated", tPayload);
+        io.emit("task_updated", tPayload);
+      }
     }
 
     auditService.logAudit({

@@ -2165,10 +2165,10 @@ export const getHourlyReports = async (params = {}) => {
   return await apiFetch(`/reports/hourly${query ? `?${query}` : ""}`);
 };
 
-export const revertAttendancePenalty = async (attendanceId, resolutionNotes = "") => {
+export const revertAttendancePenalty = async (attendanceId, resolutionNotes = "", taskId = null) => {
   return await apiFetch(`/attendance/${attendanceId}/revert-penalty`, {
     method: "POST",
-    body: JSON.stringify({ resolutionNotes })
+    body: JSON.stringify({ resolutionNotes, taskId })
   });
 };
 

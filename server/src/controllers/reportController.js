@@ -617,12 +617,22 @@ export const submitHourlyReport = async (req, res) => {
       }
     }
 
-    // If attendance is still locked due to an active SLA penalty today
+    // If attendance is locked due to SLA penalty, check if THIS specific task is penalized
     if (attendance && attendance.is_admin_locked) {
-      return res.status(403).json({
-        error: "Reporting is locked because your attendance was marked absent due to SLA penalty. Please contact Admin to unlock.",
-        locked: true
-      });
+      if (taskId) {
+        const taskCheck = await query("SELECT sla_penalty_applied FROM tasks WHERE id = $1", [taskId]);
+        if (taskCheck.rows.length > 0 && taskCheck.rows[0].sla_penalty_applied) {
+          return res.status(403).json({
+            error: "Reporting is locked because this task was marked absent due to SLA penalty (>10m). Please contact Admin to unlock.",
+            locked: true
+          });
+        }
+      } else {
+        return res.status(403).json({
+          error: "Reporting is locked because your attendance was marked absent due to SLA penalty. Please contact Admin to unlock.",
+          locked: true
+        });
+      }
     }
 
     let currentHour = reportHour;
@@ -660,7 +670,7 @@ export const submitHourlyReport = async (req, res) => {
 
     if (taskId) {
       await query(
-        "UPDATE tasks SET last_reported_at = NOW(), updated_at = NOW() WHERE id = $1",
+        "UPDATE tasks SET last_reported_at = NOW(), sla_penalty_applied = FALSE, updated_at = NOW() WHERE id = $1",
         [taskId]
       );
       const trId = "tr_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -669,6 +679,28 @@ export const submitHourlyReport = async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
         [trId, taskId, userId, companyId, actualWorkCompleted, 60]
       ).catch(() => {});
+
+      // Check if user has any remaining penalized active tasks
+      const remainingPenalized = await query(
+        `SELECT id FROM tasks 
+         WHERE assigned_to = $1 
+           AND status NOT IN ('completed', 'cancelled', 'suspended')
+           AND sla_penalty_applied = TRUE`,
+        [userId]
+      );
+      if (remainingPenalized.rows.length === 0 && attendance && attendance.is_admin_locked) {
+        await query(
+          `UPDATE attendance 
+           SET status = 'present', 
+               is_admin_locked = FALSE, 
+               penalty_status = NULL, 
+               penalty_reason = NULL,
+               penalized_by_task_id = NULL,
+               updated_at = NOW() 
+           WHERE id = $1`,
+          [attendance.id]
+        );
+      }
     }
 
     const reportRow = result.rows[0];

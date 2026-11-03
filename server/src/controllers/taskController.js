@@ -15,13 +15,14 @@ export const getTasks = async (req, res) => {
              att.status as employee_attendance_status,
              att.is_admin_locked as employee_is_admin_locked,
              att.penalty_status as employee_penalty_status,
-             att.penalty_reason as employee_penalty_reason
+             att.penalty_reason as employee_penalty_reason,
+             att.penalized_by_task_id as employee_penalized_by_task_id
       FROM tasks t
       LEFT JOIN users u ON t.assigned_to = u.id
       LEFT JOIN projects p ON t.project_id = p.id
       LEFT JOIN (
         SELECT DISTINCT ON (user_id) 
-          id as attendance_id, user_id, status, is_admin_locked, penalty_status, penalty_reason
+          id as attendance_id, user_id, status, is_admin_locked, penalty_status, penalty_reason, penalized_by_task_id
         FROM attendance 
         WHERE date >= CURRENT_DATE - INTERVAL '1 day'
         ORDER BY user_id, updated_at DESC
@@ -494,18 +495,12 @@ export const completeTask = async (req, res) => {
 
     const task = existingRes.rows[0];
 
-    // Block employee modifications if attendance is locked due to missed reports
-    if (req.user?.role !== "admin" && task.assigned_to) {
-      const attCheck = await query(
-        `SELECT is_admin_locked, status FROM attendance WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') AND is_admin_locked = TRUE LIMIT 1`,
-        [task.assigned_to]
-      );
-      if (attCheck.rows.length > 0 || task.sla_penalty_applied) {
-        return res.status(403).json({
-          error: "Task actions are locked: your attendance was marked Absent due to missing progress reports (> 10m). Please contact Admin to unlock.",
-          locked: true
-        });
-      }
+    // Block employee modifications if this task is locked due to missed reports
+    if (req.user?.role !== "admin" && task.assigned_to && task.sla_penalty_applied) {
+      return res.status(403).json({
+        error: "Task actions are locked: this task was marked Absent due to missing progress reports (> 10m). Please contact Admin to unlock.",
+        locked: true
+      });
     }
 
     const now = new Date();
@@ -558,6 +553,31 @@ export const completeTask = async (req, res) => {
          WHERE id = $2 AND metadata->'tasks' IS NOT NULL`,
         [id, task.assigned_to]
       ).catch(() => {});
+    }
+
+    // If no other active tasks are penalized, restore attendance to present
+    if (task.assigned_to) {
+      const remainingPenalized = await query(
+        `SELECT id FROM tasks 
+         WHERE assigned_to = $1 
+           AND status NOT IN ('completed', 'cancelled', 'suspended')
+           AND sla_penalty_applied = TRUE
+           AND id != $2`,
+        [task.assigned_to, id]
+      ).catch(() => ({ rows: [] }));
+      if (remainingPenalized.rows.length === 0) {
+        await query(
+          `UPDATE attendance 
+           SET status = 'present', 
+               is_admin_locked = FALSE, 
+               penalty_status = NULL, 
+               penalty_reason = NULL,
+               penalized_by_task_id = NULL,
+               updated_at = NOW() 
+           WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') AND is_admin_locked = TRUE`,
+          [task.assigned_to]
+        ).catch(() => {});
+      }
     }
 
     const completedTask = result.rows[0];
