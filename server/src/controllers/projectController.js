@@ -117,8 +117,12 @@ export const createProject = async (req, res) => {
     }
 
     const id = "proj_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-    const cleanStart = startDate ? formatDateStr(startDate) : null;
-    const cleanEnd = endDate ? formatDateStr(endDate) : null;
+    const cleanStart = (startDate || req.body.start_date) ? formatDateStr(startDate || req.body.start_date) : null;
+    const cleanEnd = (endDate || req.body.end_date || req.body.deadline) ? formatDateStr(endDate || req.body.end_date || req.body.deadline) : null;
+
+    if (cleanStart && cleanEnd && cleanEnd < cleanStart) {
+      return res.status(400).json({ error: "End date must be on or after the start date." });
+    }
 
     const result = await query(
       `INSERT INTO projects (id, company_id, name, description, start_date, end_date, manager_id, status)
@@ -134,11 +138,11 @@ export const createProject = async (req, res) => {
       await query(
         `INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
         [id, managerId]
-      ).catch(() => {});
+      ).catch(() => { });
       await query(
         `UPDATE users SET is_project_manager = true WHERE id = $1`,
         [managerId]
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     // Insert team members if provided
@@ -148,7 +152,7 @@ export const createProject = async (req, res) => {
           await query(
             `INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
             [id, memberId]
-          ).catch(() => {});
+          ).catch(() => { });
         }
       }
     }
@@ -188,19 +192,24 @@ export const updateProject = async (req, res) => {
       fields.push(`description = $${idx++}`);
       values.push(description);
     }
-    if (startDate !== undefined) {
+    const effStartDate = startDate !== undefined ? startDate : req.body.start_date; if (effStartDate !== undefined) {
       fields.push(`start_date = $${idx++}`);
-      values.push(startDate ? formatDateStr(startDate) : null);
+      values.push(effStartDate ? formatDateStr(effStartDate) : null);
     }
-    if (endDate !== undefined) {
+    const effEndDate = endDate !== undefined ? endDate : (req.body.end_date !== undefined ? req.body.end_date : req.body.deadline); if (effEndDate !== undefined) {
       fields.push(`end_date = $${idx++}`);
-      values.push(endDate ? formatDateStr(endDate) : null);
+      values.push(effEndDate ? formatDateStr(effEndDate) : null);
+    }
+    const checkStart = effStartDate !== undefined ? (effStartDate ? formatDateStr(effStartDate) : null) : (targetProj.start_date ? formatDateStr(targetProj.start_date) : null);
+    const checkEnd = effEndDate !== undefined ? (effEndDate ? formatDateStr(effEndDate) : null) : (targetProj.end_date ? formatDateStr(targetProj.end_date) : null);
+    if (checkStart && checkEnd && checkEnd < checkStart) {
+      return res.status(400).json({ error: "End date must be on or after the start date." });
     }
     if (managerId !== undefined) {
       fields.push(`manager_id = $${idx++}`);
       values.push(managerId);
       if (managerId) {
-        await query(`UPDATE users SET is_project_manager = true WHERE id = $1`, [managerId]).catch(() => {});
+        await query(`UPDATE users SET is_project_manager = true WHERE id = $1`, [managerId]).catch(() => { });
       }
     }
     if (status !== undefined) {
@@ -222,7 +231,7 @@ export const updateProject = async (req, res) => {
           await query(
             `INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
             [id, memberId]
-          ).catch(() => {});
+          ).catch(() => { });
         }
       }
     }
@@ -300,7 +309,7 @@ export const deleteProject = async (req, res) => {
 
     res.json({ message: "Project deleted successfully.", id: result.rows[0]?.id || id });
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => { });
     console.error("deleteProject error:", err);
     res.status(500).json({ error: "Failed to delete project." });
   } finally {
@@ -402,7 +411,7 @@ export const createTask = async (req, res) => {
               priority,
               dueDate,
               projectName
-            }).catch(() => {});
+            }).catch(() => { });
           }
         } catch (e) {
           console.error("Error dispatching task email:", e);

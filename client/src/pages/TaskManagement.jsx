@@ -305,6 +305,12 @@ export default function TaskManagement() {
     if (!assignEmployeeId) return showToast("Please select an assigned employee.", "warning");
     if (!assignDeadline) return showToast("Task deadline is required.", "warning");
 
+    const startMs = assignStartTime ? new Date(assignStartTime).getTime() : Date.now();
+    const endMs = new Date(assignDeadline).getTime();
+    if (endMs <= startMs) {
+      return showToast("Task deadline (end date & time) must be after the start date & time.", "warning");
+    }
+
     setSubmitting(true);
     try {
       const payload = {
@@ -1500,7 +1506,13 @@ export default function TaskManagement() {
                   <input
                     type="datetime-local"
                     value={assignStartTime}
-                    onChange={(e) => setAssignStartTime(e.target.value)}
+                    onChange={(e) => {
+                      const newStart = e.target.value;
+                      setAssignStartTime(newStart);
+                      if (assignDeadline && newStart && new Date(newStart).getTime() >= new Date(assignDeadline).getTime()) {
+                        setAssignDeadline("");
+                      }
+                    }}
                     className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
                   />
                 </div>
@@ -1510,6 +1522,7 @@ export default function TaskManagement() {
                   <input
                     type="datetime-local"
                     required
+                    min={assignStartTime || new Date().toISOString().slice(0, 16)}
                     value={assignDeadline}
                     onChange={(e) => setAssignDeadline(e.target.value)}
                     className="w-full bg-bg-base border border-border-card rounded-[12px] p-3 text-xs font-semibold text-text-main focus:outline-none focus:border-brand-primary"
@@ -1556,7 +1569,7 @@ export default function TaskManagement() {
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting}
+                  disabled={submitting || Boolean(assignStartTime && assignDeadline && new Date(assignDeadline).getTime() <= new Date(assignStartTime).getTime())}
                   className="px-5 py-2.5 bg-brand-primary text-white rounded-[10px] text-xs font-bold hover:bg-brand-primary/90 transition-all cursor-pointer shadow-sm disabled:opacity-50"
                 >
                   {submitting ? "Assigning..." : "Assign Task"}

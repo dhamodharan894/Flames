@@ -685,9 +685,9 @@ export const subscribeToRegularizationRequests = (companyId, callback) => {
 // ----------------------------------------------------
 
 export const createProject = async (...args) => {
-  let name, description, teamMembers, deadline, companyId, startDate, managerId, status;
+  let name, description, teamMembers, deadline, companyId, startDate, endDate, managerId, status;
   if (typeof args[0] === "object") {
-    ({ name, description, teamMembers, deadline, companyId, startDate, managerId, status } = args[0]);
+    ({ name, description, teamMembers, deadline, companyId, startDate, endDate, managerId, status } = args[0]);
   } else {
     [name, description, teamMembers = [], deadline = "", companyId = "", startDate = "", managerId = "", status = "Ongoing"] = args;
   }
@@ -697,10 +697,10 @@ export const createProject = async (...args) => {
       name,
       description,
       teamMembers,
-      deadline,
+      deadline: endDate || deadline || null,
       companyId,
-      startDate: startDate || deadline,
-      endDate: deadline,
+      startDate: startDate || (deadline && !endDate ? deadline : null),
+      endDate: endDate || deadline || null,
       managerId,
       status
     })

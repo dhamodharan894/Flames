@@ -1185,6 +1185,9 @@ export default function ProjectManagement() {
     if (!projectNameInput || !projectStartDate || !projectEndDate || !projectManagerId) {
       return showToast("Please fill in all fields", "warning");
     }
+    if (projectEndDate < projectStartDate) {
+      return showToast("End date must be on or after the start date", "warning");
+    }
 
     try {
       const selectedManager = allUsers.find(u => u.uid === projectManagerId);
@@ -1387,8 +1390,8 @@ export default function ProjectManagement() {
     setEditProjectData({
       id: proj.id,
       name: proj.name || "",
-      startDate: proj.startDate !== "-" ? proj.startDate : "",
-      endDate: proj.endDate !== "-" ? proj.endDate : "",
+      startDate: (proj.startDate && proj.startDate !== "-") ? proj.startDate : (proj.start_date && proj.start_date !== "-" ? proj.start_date : ""),
+      endDate: (proj.endDate && proj.endDate !== "-") ? proj.endDate : (proj.end_date && proj.end_date !== "-" ? proj.end_date : ""),
       managerId: proj.managerId || "",
       status: isStandardStatus ? (proj.status || "Ongoing") : "Other",
       customStatus: isStandardStatus ? "" : proj.status
@@ -1398,6 +1401,9 @@ export default function ProjectManagement() {
 
   const handleSaveProjectEdits = async (e) => {
     e.preventDefault();
+    if (editProjectData.startDate && editProjectData.endDate && editProjectData.endDate < editProjectData.startDate) {
+      return showToast("End date must be on or after the start date", "warning");
+    }
     try {
       const finalStatus = editProjectData.status === "Other" ? (editProjectData.customStatus || "Ongoing") : editProjectData.status;
       const updates = {
@@ -3291,7 +3297,13 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
                     value={projectStartDate}
-                    onChange={(e) => setProjectStartDate(e.target.value)}
+                    onChange={(e) => {
+                      const newStart = e.target.value;
+                      setProjectStartDate(newStart);
+                      if (projectEndDate && newStart && newStart > projectEndDate) {
+                        setProjectEndDate("");
+                      }
+                    }}
                     required
                   />
                 </div>
@@ -3301,6 +3313,7 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
                     value={projectEndDate}
+                    min={projectStartDate || undefined}
                     onChange={(e) => setProjectEndDate(e.target.value)}
                     required
                   />
@@ -3324,7 +3337,7 @@ export default function ProjectManagement() {
 
               <div className="flex justify-end gap-3 pt-4 border-t border-border-card mt-4">
                 <button type="button" onClick={() => setShowCreateProjectModal(false)} className="py-2 px-4 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer">Cancel</button>
-                <button type="submit" disabled={!projectNameInput || !projectStartDate || !projectEndDate || !projectManagerId} className="py-2 px-4 bg-brand-primary hover:bg-brand-hover text-white rounded-[10px] text-xs font-bold transition-colors cursor-pointer disabled:opacity-50">
+                <button type="submit" disabled={!projectNameInput || !projectStartDate || !projectEndDate || !projectManagerId || (projectStartDate && projectEndDate && projectEndDate < projectStartDate)} className="py-2 px-4 bg-brand-primary hover:bg-brand-hover text-white rounded-[10px] text-xs font-bold transition-colors cursor-pointer disabled:opacity-50">
                   Create Project
                 </button>
               </div>
@@ -3366,7 +3379,14 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
                     value={editProjectData.startDate}
-                    onChange={(e) => setEditProjectData({ ...editProjectData, startDate: e.target.value })}
+                    onChange={(e) => {
+                      const newStart = e.target.value;
+                      setEditProjectData(prev => ({
+                        ...prev,
+                        startDate: newStart,
+                        endDate: (prev.endDate && newStart && newStart > prev.endDate) ? "" : prev.endDate
+                      }));
+                    }}
                     required
                   />
                 </div>
@@ -3376,6 +3396,7 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-3.5 py-2.5 border border-border-card rounded-[12px] bg-bg-base/30 text-xs text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all"
                     value={editProjectData.endDate}
+                    min={editProjectData.startDate || undefined}
                     onChange={(e) => setEditProjectData({ ...editProjectData, endDate: e.target.value })}
                     required
                   />
@@ -3427,7 +3448,7 @@ export default function ProjectManagement() {
 
               <div className="pt-4 flex justify-end gap-2 border-t border-border-card">
                 <button type="button" onClick={() => setShowEditProjectModal(false)} className="py-2 px-4 border border-border-card rounded-[10px] text-xs font-bold text-text-sec hover:bg-bg-base cursor-pointer">Cancel</button>
-                <button type="submit" className="py-2 px-6 bg-brand-primary hover:bg-brand-hover text-white rounded-[10px] text-xs font-bold shadow-md shadow-brand-primary/20 transition-all cursor-pointer">Save Changes</button>
+                <button type="submit" disabled={Boolean(editProjectData.startDate && editProjectData.endDate && editProjectData.endDate < editProjectData.startDate)} className="py-2 px-6 bg-brand-primary hover:bg-brand-hover text-white rounded-[10px] text-xs font-bold shadow-md shadow-brand-primary/20 transition-all cursor-pointer disabled:opacity-50">Save Changes</button>
               </div>
             </form>
           </div>
@@ -3730,7 +3751,13 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-4 py-2.5 border border-border-card rounded-[12px] bg-bg-base/40 text-xs font-medium text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all cursor-pointer"
                     value={weeklyReportStartDate}
-                    onChange={(e) => setWeeklyReportStartDate(e.target.value)}
+                    onChange={(e) => {
+                      const newStart = e.target.value;
+                      setWeeklyReportStartDate(newStart);
+                      if (weeklyReportEndDate && newStart && newStart > weeklyReportEndDate) {
+                        setWeeklyReportEndDate("");
+                      }
+                    }}
                     required
                   />
                 </div>
@@ -3742,6 +3769,7 @@ export default function ProjectManagement() {
                     type="date" 
                     className="w-full px-4 py-2.5 border border-border-card rounded-[12px] bg-bg-base/40 text-xs font-medium text-text-main outline-none focus:bg-bg-card focus:border-brand-primary transition-all cursor-pointer"
                     value={weeklyReportEndDate}
+                    min={weeklyReportStartDate || undefined}
                     onChange={(e) => setWeeklyReportEndDate(e.target.value)}
                     required
                   />

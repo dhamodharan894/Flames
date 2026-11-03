@@ -97,6 +97,14 @@ export const createTask = async (req, res) => {
       return res.status(400).json({ error: "Assigned employee is required." });
     }
 
+    if (targetDeadline && startTime) {
+      const s = new Date(startTime).getTime();
+      const d = new Date(targetDeadline).getTime();
+      if (!isNaN(s) && !isNaN(d) && d <= s) {
+        return res.status(400).json({ error: "Task deadline (end date) must be after start date/time." });
+      }
+    }
+
     const id = "task_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
     const taskMeta = {
       deadlineTimestamp: targetDeadline || null,
