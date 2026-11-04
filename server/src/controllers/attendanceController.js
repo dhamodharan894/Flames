@@ -1501,93 +1501,50 @@ export const adminRevertPenalty = async (req, res) => {
 
     const record = existingRes.rows[0];
 
-    // If taskId is provided, unlock ONLY that specific task!
+    // Fully unlock task(s) and restore employee attendance in a single action
     let updatedTasks = [];
-    let remainingPenalized = { rows: [] };
-    let updatedAttendance = null;
+    const nowIso = new Date().toISOString();
 
     if (taskId) {
-      const nowIso = new Date().toISOString();
-      const tRes = await query(
-        `UPDATE tasks 
-         SET sla_penalty_applied = FALSE, 
-             last_reported_at = NOW(), 
+      await query(
+        `UPDATE tasks
+         SET sla_penalty_applied = FALSE,
+             last_reported_at = NOW(),
              updated_at = NOW(),
              metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{unlockedAt}', to_jsonb($2::text))
-         WHERE id = $1 
-         RETURNING *`,
+         WHERE id = $1`,
         [taskId, nowIso]
       );
-      updatedTasks = tRes.rows || [];
-
-      // Check if there are any other active tasks of this employee that remain penalized
-      remainingPenalized = await query(
-        `SELECT id, title FROM tasks 
-         WHERE assigned_to = $1 
-           AND status NOT IN ('completed', 'cancelled', 'suspended')
-           AND sla_penalty_applied = TRUE 
-           AND id != $2`,
-        [record.user_id, taskId]
-      );
-
-      if (remainingPenalized.rows.length === 0) {
-        // All active tasks are clear; restore attendance to Present
-        const attRes = await query(
-          `UPDATE attendance
-           SET status = 'present',
-               is_admin_locked = FALSE,
-               penalty_status = NULL,
-               penalty_reason = NULL,
-               penalized_by_task_id = NULL,
-               updated_at = NOW()
-           WHERE id = $1
-           RETURNING *`,
-          [record.id]
-        );
-        updatedAttendance = attRes.rows[0];
-      } else {
-        // Other tasks still penalized; keep attendance marked absent referencing the remaining task
-        const nextTask = remainingPenalized.rows[0];
-        const attRes = await query(
-          `UPDATE attendance
-           SET penalty_reason = $1,
-               penalized_by_task_id = $2,
-               updated_at = NOW()
-           WHERE id = $3
-           RETURNING *`,
-          [`Missed required progress report on task "${nextTask.title}" for > 10 minutes (exceeded 10-minute limit).`, nextTask.id, record.id]
-        );
-        updatedAttendance = attRes.rows[0];
-      }
-    } else {
-      const allRes = await query(
-        `UPDATE tasks 
-         SET sla_penalty_applied = FALSE, 
-             last_reported_at = NOW(), 
-             updated_at = NOW(),
-             metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{unlockedAt}', to_jsonb(NOW()::text))
-         WHERE assigned_to = $1 
-           AND status NOT IN ('completed', 'cancelled', 'suspended')
-         RETURNING *`,
-        [record.user_id]
-      ).catch(() => ({ rows: [] }));
-      if (allRes?.rows) updatedTasks = allRes.rows;
-
-      const attRes = await query(
-        `UPDATE attendance
-         SET status = 'present',
-             is_admin_locked = FALSE,
-             penalty_status = NULL,
-             penalty_reason = NULL,
-             penalized_by_task_id = NULL,
-             updated_at = NOW()
-         WHERE id = $1
-         RETURNING *`,
-        [record.id]
-      );
-      updatedAttendance = attRes.rows[0];
     }
 
+    // Clear penalty on all active tasks of this employee and restart 5-min reporting timer from now
+    const allRes = await query(
+      `UPDATE tasks
+       SET sla_penalty_applied = FALSE,
+           last_reported_at = NOW(),
+           updated_at = NOW(),
+           metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{unlockedAt}', to_jsonb($2::text))
+       WHERE assigned_to = $1
+         AND status NOT IN ('completed', 'cancelled', 'suspended')
+       RETURNING *`,
+      [record.user_id, nowIso]
+    ).catch(() => ({ rows: [] }));
+    if (allRes?.rows) updatedTasks = allRes.rows;
+
+    // Restore employee attendance record to Present and remove lock
+    const attRes = await query(
+      `UPDATE attendance
+       SET status = 'present',
+           is_admin_locked = FALSE,
+           penalty_status = NULL,
+           penalty_reason = NULL,
+           penalized_by_task_id = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [record.id]
+    );
+    const updatedAttendance = attRes.rows[0];
     const updated = updatedAttendance || record;
 
     const notifId = "notif_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);

@@ -2047,16 +2047,13 @@ export default function ProjectManagement() {
               ) : (
                 paginatedTeam.map((member) => {
                   const tasks = member.tasks || [];
-                  const totalEstimatedHours = tasks.reduce((sum, t) => sum + (Number(t.duration) || 0), 0);
-                  const totalTrackedHours = tasks.reduce((sum, t) => sum + calculateTimeSpent(allTaskReports[t.id] || []), 0);
-                  
-                  let progress = 0;
-                  if (totalEstimatedHours > 0) {
-                    progress = Math.min(100, Math.round((totalTrackedHours / totalEstimatedHours) * 100));
-                  } else {
-                    const completed = tasks.filter(t => t.completed).length;
-                    progress = tasks.length > 0 ? Math.round((completed / tasks.length) * 100) : 0;
-                  }
+                  const completedCount = tasks.filter(t => Boolean(
+                    t.completed === true || 
+                    t.completed === "true" || 
+                    t.isCompleted === true || 
+                    (typeof t.status === "string" && t.status.toLowerCase() === "completed")
+                  )).length;
+                  const progress = tasks.length > 0 ? Math.min(100, Math.round((completedCount / tasks.length) * 100)) : 0;
 
                   return (
                     <tr key={member.uid} className="border-b border-border-card/50 hover:bg-bg-base/30 transition-colors group">

@@ -229,6 +229,129 @@ export default function TaskManagement() {
   }, [activeSubTab, tasks]);
 
   // ----------------------------------------------------
+  // Helper: Compute effective deadline from explicit deadline, due date, or estimated duration
+  const getEffectiveDeadline = (task) => {
+    if (!task) return null;
+    if (task.deadline) return task.deadline;
+    if (task.dueDate || task.due_date) return task.dueDate || task.due_date;
+    const durHours = Number(task.duration) || (task.duration_minutes ? Number(task.duration_minutes) / 60 : 0) || (task.durationMinutes ? Number(task.durationMinutes) / 60 : 0);
+    if (durHours > 0) {
+      const base = task.assignedAt || task.assigned_at || task.start_time || task.startTime || task.created_at || (task.id && !isNaN(Number(String(task.id).replace("task_", ""))) ? Number(String(task.id).replace("task_", "")) : null);
+      const baseMs = base ? new Date(base).getTime() : Date.now();
+      if (!isNaN(baseMs)) {
+        return new Date(baseMs + durHours * 3600 * 1000).toISOString();
+      }
+    }
+    return null;
+  };
+
+  // Helper: Format countdown remaining
+  const formatCountdown = (deadlineStr) => {
+    if (!deadlineStr) return null;
+    const dl = new Date(deadlineStr).getTime();
+    if (isNaN(dl)) return null;
+
+    const diff = dl - now;
+    if (diff <= 0) {
+      const overdueMins = Math.floor(Math.abs(diff) / 60000);
+      const overdueHrs = Math.floor(overdueMins / 60);
+      if (overdueHrs > 0) {
+        return { isOverdue: true, text: `Overdue by ${overdueHrs}h ${overdueMins % 60}m` };
+      }
+      return { isOverdue: true, text: `Overdue by ${overdueMins}m` };
+    }
+
+    const totalSeconds = Math.floor(diff / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    return {
+      isOverdue: false,
+      text: `${hours > 0 ? `${hours}h ` : ""}${minutes}m ${seconds}s remaining`
+    };
+  };
+
+  // Helper: Format next progress report countdown (Enforces 5-minute cycle, 10-minute absence penalty)
+  const getNextReportDue = (task) => {
+    if (!task) return null;
+    const isCompleted = task.status === "completed" || task.status === "Completed" || task.completed;
+    if (isCompleted || task.status === "cancelled" || task.status === "suspended") {
+      return null;
+    }
+    const dl = task.deadline || task.metadata?.deadlineTimestamp || task.due_date || task.dueDate;
+    if (dl && new Date(dl).getTime() < now) {
+      return null;
+    }
+    const todayStr = new Date().toISOString().split("T")[0];
+    const sessionKey = `hourly_cycle_${task.id}_${todayStr}`;
+    let baseTime = null;
+
+    // 1. If a report was submitted today for this specific task, count 5 mins from that report:
+    const lastReport = task.lastReportedAt || task.last_reported_at;
+    if (lastReport) {
+      const repTime = new Date(lastReport).getTime();
+      const isToday = new Date().toDateString() === new Date(repTime).toDateString();
+      if (isToday) {
+        baseTime = repTime;
+      }
+    }
+
+    // 2. Check localStorage if this specific task was submitted today in this browser session
+    if (!baseTime) {
+      const stored = localStorage.getItem(sessionKey);
+      if (stored) {
+        const storedTime = parseInt(stored, 10);
+        if (!isNaN(storedTime) && new Date().toDateString() === new Date(storedTime).toDateString()) {
+          baseTime = storedTime;
+        }
+      }
+    }
+
+    // 3. If task was explicitly unlocked or extended by admin, baseline from that timestamp
+    const meta = (task.metadata && typeof task.metadata === 'object') ? task.metadata : {};
+    const unlockTime = meta.unlockedAt ? new Date(meta.unlockedAt).getTime() : 0;
+    const extendTime = meta.extendedAt ? new Date(meta.extendedAt).getTime() : 0;
+    const adminActionTime = Math.max(unlockTime, extendTime);
+    if (adminActionTime > 0) {
+      baseTime = adminActionTime;
+    }
+
+    // 4. Fallback to this specific task's own assignment time
+    if (!baseTime) {
+      const assignTime = task.assignedAt || task.assigned_at || task.createdAt || task.created_at;
+      if (assignTime) {
+        baseTime = new Date(assignTime).getTime();
+      }
+    }
+
+    if (!baseTime || isNaN(baseTime)) return null;
+
+    const nextDue = baseTime + 5 * 60 * 1000; // 5 minutes cycle
+    const diff = nextDue - now;
+
+    const isRecordLocked = Boolean(
+      task.slaPenaltyApplied ||
+      task.sla_penalty_applied
+    );
+
+    if (isRecordLocked) {
+      return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
+    }
+
+    if (diff <= 0) {
+      const overdueMins = Math.floor(Math.abs(diff) / 60000);
+      if (overdueMins >= 5) {
+        return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
+      }
+      return { isOverdue: true, isLocked: false, text: `Report overdue by ${overdueMins}m` };
+    }
+
+    const mins = Math.floor(diff / 60000);
+    const secs = Math.floor((diff % 60000) / 1000);
+    return { isOverdue: false, text: `Next report in ${mins}m ${secs}s` };
+  };
+
   // COMPUTED METRICS FOR ADMIN MONITORING
   // ----------------------------------------------------
   const adminMetrics = useMemo(() => {
@@ -436,7 +559,52 @@ export default function TaskManagement() {
 
     setSubmitting(true);
     try {
+      const nowIso = new Date().toISOString();
+      const targetUserId = selectedAttendanceRecord.userId || selectedAttendanceRecord.assignedTo;
       await revertAttendancePenalty(selectedAttendanceRecord.id, revertNotes, selectedAttendanceRecord.taskId);
+      
+      // Update local admin tasks state immediately so all active tasks of this employee show as unlocked & Present
+      setAdminAllTasks(prev => prev.map(t => {
+        const isTargetUser = (targetUserId && (t.assigned_to === targetUserId || t.assignedTo === targetUserId)) ||
+                             (selectedAttendanceRecord.userName && (t.assignee_name === selectedAttendanceRecord.userName || t.assigneeName === selectedAttendanceRecord.userName));
+        if (isTargetUser || t.id === selectedAttendanceRecord.taskId) {
+          return {
+            ...t,
+            sla_penalty_applied: false,
+            slaPenaltyApplied: false,
+            employee_attendance_status: "present",
+            employee_is_admin_locked: false,
+            employee_penalty_status: null,
+            employee_penalty_reason: null,
+            last_reported_at: nowIso,
+            lastReportedAt: nowIso,
+            metadata: {
+              ...(t.metadata || {}),
+              unlockedAt: nowIso
+            }
+          };
+        }
+        return t;
+      }));
+
+      // Also update tasks state if viewing personal tasks
+      setTasks(prev => prev.map(t => {
+        if (t.id === selectedAttendanceRecord.taskId || t.assigned_to === targetUserId || t.assignedTo === targetUserId) {
+          return {
+            ...t,
+            sla_penalty_applied: false,
+            slaPenaltyApplied: false,
+            last_reported_at: nowIso,
+            lastReportedAt: nowIso,
+            metadata: {
+              ...(t.metadata || {}),
+              unlockedAt: nowIso
+            }
+          };
+        }
+        return t;
+      }));
+
       showToast("Attendance penalty successfully reverted! Employee restored to Present.", "success");
       setShowRevertModal(false);
       setSelectedAttendanceRecord(null);
@@ -477,121 +645,6 @@ export default function TaskManagement() {
       console.error("Complete Task error:", err);
       showToast(err.message || "Failed to update task status.", "error");
     }
-  };
-
-  // Helper: Compute effective deadline from explicit deadline, due date, or estimated duration
-  const getEffectiveDeadline = (task) => {
-    if (!task) return null;
-    if (task.deadline) return task.deadline;
-    if (task.dueDate || task.due_date) return task.dueDate || task.due_date;
-    const durHours = Number(task.duration) || (task.duration_minutes ? Number(task.duration_minutes) / 60 : 0) || (task.durationMinutes ? Number(task.durationMinutes) / 60 : 0);
-    if (durHours > 0) {
-      const base = task.assignedAt || task.assigned_at || task.start_time || task.startTime || task.created_at || (task.id && !isNaN(Number(String(task.id).replace("task_", ""))) ? Number(String(task.id).replace("task_", "")) : null);
-      const baseMs = base ? new Date(base).getTime() : Date.now();
-      if (!isNaN(baseMs)) {
-        return new Date(baseMs + durHours * 3600 * 1000).toISOString();
-      }
-    }
-    return null;
-  };
-
-  // Helper: Format countdown remaining
-  const formatCountdown = (deadlineStr) => {
-    if (!deadlineStr) return null;
-    const dl = new Date(deadlineStr).getTime();
-    if (isNaN(dl)) return null;
-
-    const diff = dl - now;
-    if (diff <= 0) {
-      const overdueMins = Math.floor(Math.abs(diff) / 60000);
-      const overdueHrs = Math.floor(overdueMins / 60);
-      if (overdueHrs > 0) {
-        return { isOverdue: true, text: `Overdue by ${overdueHrs}h ${overdueMins % 60}m` };
-      }
-      return { isOverdue: true, text: `Overdue by ${overdueMins}m` };
-    }
-
-    const totalSeconds = Math.floor(diff / 1000);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-
-    return {
-      isOverdue: false,
-      text: `${hours > 0 ? `${hours}h ` : ""}${minutes}m ${seconds}s remaining`
-    };
-  };
-
-  // Helper: Format next progress report countdown (Enforces 5-minute cycle, 10-minute absence penalty)
-  const getNextReportDue = (task) => {
-    if (!task) return null;
-    const todayStr = new Date().toISOString().split("T")[0];
-    const sessionKey = `hourly_cycle_${task.id}_${todayStr}`;
-    let baseTime = null;
-
-    // 1. If a report was submitted today for this specific task, count 5 mins from that report:
-    const lastReport = task.lastReportedAt || task.last_reported_at;
-    if (lastReport) {
-      const repTime = new Date(lastReport).getTime();
-      const isToday = new Date().toDateString() === new Date(repTime).toDateString();
-      if (isToday) {
-        baseTime = repTime;
-      }
-    }
-
-    // 2. Check localStorage if this specific task was submitted today in this browser session
-    if (!baseTime) {
-      const stored = localStorage.getItem(sessionKey);
-      if (stored) {
-        const storedTime = parseInt(stored, 10);
-        if (!isNaN(storedTime) && new Date().toDateString() === new Date(storedTime).toDateString()) {
-          baseTime = storedTime;
-        }
-      }
-    }
-
-    // 3. If task was explicitly unlocked or extended by admin, baseline from that timestamp
-    const meta = (task.metadata && typeof task.metadata === 'object') ? task.metadata : {};
-    const unlockTime = meta.unlockedAt ? new Date(meta.unlockedAt).getTime() : 0;
-    const extendTime = meta.extendedAt ? new Date(meta.extendedAt).getTime() : 0;
-    const adminActionTime = Math.max(unlockTime, extendTime);
-    if (adminActionTime > 0 && (!baseTime || adminActionTime > baseTime)) {
-      baseTime = adminActionTime;
-    }
-
-    // 4. Fallback to this specific task's own assignment time
-    if (!baseTime) {
-      const assignTime = task.assignedAt || task.assigned_at || task.createdAt || task.created_at;
-      if (assignTime) {
-        baseTime = new Date(assignTime).getTime();
-      }
-    }
-
-    if (!baseTime || isNaN(baseTime)) return null;
-
-    const nextDue = baseTime + 5 * 60 * 1000; // 5 minutes cycle
-    const diff = nextDue - now;
-
-    const isRecordLocked = Boolean(
-      task.slaPenaltyApplied ||
-      task.sla_penalty_applied
-    );
-
-    if (isRecordLocked) {
-      return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
-    }
-
-    if (diff <= 0) {
-      const overdueMins = Math.floor(Math.abs(diff) / 60000);
-      if (overdueMins >= 5) {
-        return { isOverdue: true, isLocked: true, text: "Locked (Absent Penalty)" };
-      }
-      return { isOverdue: true, isLocked: false, text: `Report overdue by ${overdueMins}m` };
-    }
-
-    const mins = Math.floor(diff / 60000);
-    const secs = Math.floor((diff % 60000) / 1000);
-    return { isOverdue: false, text: `Next report in ${mins}m ${secs}s` };
   };
 
   return (
@@ -833,9 +886,10 @@ export default function TaskManagement() {
                     filteredAdminTasks.map(t => {
                       const effectiveDeadline = getEffectiveDeadline(t);
                       const countdown = formatCountdown(effectiveDeadline);
-                      const isUnviewedSlaViolated = !t.viewed_at && !t.viewedAt && (now - new Date(t.assigned_at || t.created_at).getTime()) > 60 * 60 * 1000;
-                      const nextReport = getNextReportDue(t);
-                      const isAbsent = Boolean(t.sla_penalty_applied || t.slaPenaltyApplied || (nextReport && nextReport.isLocked));
+                      const isCompleted = t.status === "completed" || t.status === "Completed" || t.completed;
+                      const isUnviewedSlaViolated = !isCompleted && !t.viewed_at && !t.viewedAt && (now - new Date(t.assigned_at || t.created_at).getTime()) > 60 * 60 * 1000;
+                      const nextReport = isCompleted ? null : getNextReportDue(t);
+                      const isAbsent = !isCompleted && Boolean(t.sla_penalty_applied || t.slaPenaltyApplied || (nextReport && nextReport.isLocked));
                       const isLocked = isAbsent;
 
                       return (
@@ -932,6 +986,7 @@ export default function TaskManagement() {
                                     setSelectedAttendanceRecord({
                                       id: t.attendance_id || t.attendanceId || t.assigned_to,
                                       userName: t.assignee_name || t.assigneeName,
+                                      userId: t.assigned_to || t.assignedTo,
                                       taskTitle: t.title,
                                       taskId: t.id
                                     });

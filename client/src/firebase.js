@@ -14,25 +14,22 @@ const getHeaders = () => {
   };
 };
 
-// Resilient API Fetch with Local/Railway auto-fallback
+// Resilient API Fetch with Centralized Local (Port 5001) & Railway auto-fallback
 export const apiFetch = async (endpoint, options = {}) => {
   const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
   const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
-  // Determine candidate URLs (prioritize local backend when developing locally)
+  // Determine candidate URLs (prioritize configured VITE_API_URL, then local port 5001)
   const candidateUrls = [];
+  if (import.meta.env.VITE_API_URL) {
+    const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
+    candidateUrls.push(`${envBase}${cleanEndpoint}`);
+  }
+
   if (isLocal) {
-    candidateUrls.push(`http://localhost:5005/api${cleanEndpoint}`);
-    candidateUrls.push(`http://127.0.0.1:5005/api${cleanEndpoint}`);
-    if (import.meta.env.VITE_API_URL && (import.meta.env.VITE_API_URL.includes("localhost") || import.meta.env.VITE_API_URL.includes("127.0.0.1"))) {
-      const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
-      candidateUrls.push(`${envBase}${cleanEndpoint}`);
-    }
+    candidateUrls.push(`http://localhost:5001/api${cleanEndpoint}`);
+    candidateUrls.push(`http://127.0.0.1:5001/api${cleanEndpoint}`);
   } else {
-    if (import.meta.env.VITE_API_URL) {
-      const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
-      candidateUrls.push(`${envBase}${cleanEndpoint}`);
-    }
     candidateUrls.push(`${PRODUCTION_API_URL}${cleanEndpoint}`);
     if (typeof window !== "undefined" && window.location.origin) {
       candidateUrls.push(`${window.location.origin}/api${cleanEndpoint}`);
@@ -1873,6 +1870,12 @@ export const subscribeToNotifications = (userId, callback) => {
 export const markNotificationRead = async (notificationId) => {
   return apiFetch(`/notifications/${notificationId}/read`, {
     method: "PATCH"
+  }).catch(() => true);
+};
+
+export const deleteNotification = async (notificationId) => {
+  return apiFetch(`/notifications/${notificationId}`, {
+    method: "DELETE"
   }).catch(() => true);
 };
 

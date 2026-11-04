@@ -54,6 +54,7 @@ import {
   subscribeToDmThreads,
   subscribeToNotifications,
   markNotificationRead,
+  deleteNotification,
   createNotification,
   updateTaskWarningSent,
   getCompanies,
@@ -172,6 +173,44 @@ export default function DashboardLayout({ children }) {
 
   // Notice board, rules & notification states
   const [showNotifications, setShowNotifications] = useState(false);
+  const [notifFilter, setNotifFilter] = useState("all"); // 'all', 'unread', 'tasks', 'attendance', 'leaves'
+
+  const formatNotifDateTime = (item) => {
+    const raw = item?.timestamp || item?.createdAt || item?.created_at || item?.updatedAt || item?.updated_at || item?.date;
+    if (!raw) return "";
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) return "";
+
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const isYesterday = d.toDateString() === yesterday.toDateString();
+
+    const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+
+    if (isToday) {
+      return `Today, ${timeStr}`;
+    }
+    if (isYesterday) {
+      return `Yesterday, ${timeStr}`;
+    }
+    return `${dateStr} • ${timeStr}`;
+  };
+
+  const handleDeleteSystemNotif = async (e, id) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      await deleteNotification(id);
+      setSystemNotifications(prev => prev.filter(n => n.id !== id));
+      showToast("Notification deleted.", "success");
+    } catch (err) {
+      console.error("Delete notif error:", err);
+    }
+  };
   const [showRulesModal, setShowRulesModal] = useState(false);
   const [rules, setRules] = useState("");
   const [leaveRequestsList, setLeaveRequestsList] = useState([]);
@@ -496,14 +535,47 @@ export default function DashboardLayout({ children }) {
     ...systemNotifications.map(n => ({
       ...n,
       isSystemNotif: true,
-      sortDate: new Date(n.timestamp).getTime()
+      sortDate: new Date(n.timestamp || n.createdAt || n.created_at || Date.now()).getTime()
     })),
     ...activeNotifications.map(r => ({
       ...r,
       isLeaveNotif: true,
-      sortDate: new Date(r.updatedAt || r.createdAt).getTime()
+      sortDate: new Date(r.updatedAt || r.createdAt || Date.now()).getTime()
     }))
-  ].sort((a, b) => b.sortDate - a.sortDate);
+  ].sort((a, b) => (b.sortDate || 0) - (a.sortDate || 0));
+
+  const isTaskNotif = (item) => {
+    const text = `${item.title || ""} ${item.message || ""} ${item.type || ""}`.toLowerCase();
+    return text.includes("task") || text.includes("project") || text.includes("deadline") || text.includes("assign");
+  };
+
+  const isAttendanceNotif = (item) => {
+    const text = `${item.title || ""} ${item.message || ""} ${item.type || ""}`.toLowerCase();
+    return text.includes("attendance") || text.includes("absent") || text.includes("check") || text.includes("report") || text.includes("penalty") || text.includes("sla");
+  };
+
+  const isLeaveOrRequestNotif = (item) => {
+    if (item.isLeaveNotif) return true;
+    const text = `${item.title || ""} ${item.message || ""} ${item.type || ""}`.toLowerCase();
+    return text.includes("leave") || text.includes("permission") || text.includes("regulariz");
+  };
+
+  const filteredNotifs = combinedNotifs.filter(item => {
+    if (notifFilter === "unread") {
+      if (item.isSystemNotif) return !item.read;
+      if (item.isLeaveNotif) {
+        const seenStr = localStorage.getItem(`seen_leaves_${currentUser?.uid}`);
+        const seen = seenStr ? JSON.parse(seenStr) : {};
+        const isNewUpdate = currentUser?.role !== "admin" && seen[item.id] !== item.status && item.status !== "pending";
+        return currentUser?.role === "admin" ? true : isNewUpdate;
+      }
+      return false;
+    }
+    if (notifFilter === "tasks") return isTaskNotif(item);
+    if (notifFilter === "attendance") return isAttendanceNotif(item);
+    if (notifFilter === "leaves") return isLeaveOrRequestNotif(item);
+    return true; // "all"
+  });
 
   const systemUnread = systemNotifications.filter(n => !n.read).length;
   const leaveUnread = currentUser?.role === "admin" ? activeNotifications.length : newUpdatesCount;
@@ -1475,9 +1547,16 @@ export default function DashboardLayout({ children }) {
                   {/* Backdrop - clicks outside to close */}
                   <div className="fixed inset-0 z-[199]" onClick={() => setShowNotifications(false)} />
                   {/* Dropdown panel - fixed so it's never clipped by parent overflow/z-index */}
-                  <div className="fixed top-[65px] sm:top-[75px] right-3 sm:right-4 lg:right-8 w-[calc(100vw-1.5rem)] max-w-[340px] bg-bg-card border border-border-card rounded-[16px] shadow-2xl p-4 z-[200] text-left animate-scale-up">
-                    <div className="flex justify-between items-center mb-3 pb-2 border-b border-border-card">
-                      <span className="font-extrabold text-xs text-text-main uppercase tracking-wider"><Bell size={14} className='inline-block mr-1' /> Notifications</span>
+                  <div className="fixed top-[65px] sm:top-[75px] right-3 sm:right-4 lg:right-8 w-[calc(100vw-1.5rem)] max-w-[400px] bg-bg-card border border-border-card rounded-[16px] shadow-2xl p-4 z-[200] text-left animate-scale-up">
+                    <div className="flex justify-between items-center mb-2.5 pb-2 border-b border-border-card">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-extrabold text-xs text-text-main uppercase tracking-wider flex items-center gap-1">
+                          <Bell size={14} className='text-brand-primary' /> Notifications
+                        </span>
+                        <span className="text-[10px] font-bold text-text-mut bg-bg-base/60 px-1.5 py-0.5 rounded-full">
+                          {combinedNotifs.length}
+                        </span>
+                      </div>
                       <div className="flex items-center gap-2">
                         {totalUnreadCount > 0 && (
                           <>
@@ -1498,43 +1577,78 @@ export default function DashboardLayout({ children }) {
                       </div>
                     </div>
 
-                    {combinedNotifs.length === 0 ? (
+                    {/* Filter Pills */}
+                    <div className="flex items-center gap-1 mb-2.5 pb-1 overflow-x-auto scrollbar-none text-[10px] font-bold">
+                      {[
+                        { id: "all", label: "All", count: combinedNotifs.length },
+                        { id: "unread", label: "Unread", count: totalUnreadCount },
+                        { id: "tasks", label: "Tasks", count: combinedNotifs.filter(isTaskNotif).length },
+                        { id: "attendance", label: "Attendance", count: combinedNotifs.filter(isAttendanceNotif).length },
+                        { id: "leaves", label: "Leaves", count: combinedNotifs.filter(isLeaveOrRequestNotif).length }
+                      ].map(tab => (
+                        <button
+                          key={tab.id}
+                          onClick={() => setNotifFilter(tab.id)}
+                          className={`px-2 py-0.5 rounded-full transition-all whitespace-nowrap cursor-pointer flex items-center gap-1 ${
+                            notifFilter === tab.id
+                              ? "bg-brand-primary text-white shadow-xs"
+                              : "bg-bg-base/50 text-text-sec hover:bg-bg-base hover:text-text-main"
+                          }`}
+                        >
+                          <span>{tab.label}</span>
+                          <span className={`text-[9px] px-1 rounded-full ${notifFilter === tab.id ? "bg-white/20 text-white" : "bg-bg-card text-text-mut"}`}>
+                            {tab.count}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {filteredNotifs.length === 0 ? (
                       <div className="py-8 text-center">
                         <div className="text-3xl mb-2"><Mailbox size={32} className='mx-auto text-brand-primary' /></div>
-                        <p className="text-xs text-text-mut font-semibold">No notifications yet.</p>
+                        <p className="text-xs text-text-mut font-semibold">No notifications found.</p>
                       </div>
                     ) : (
-                      <div className="max-h-64 overflow-y-auto space-y-2.5 pr-1 overscroll-contain">
-                        {combinedNotifs.slice(0, 15).map((item) => {
+                      <div className="max-h-[360px] sm:max-h-[420px] overflow-y-auto space-y-2.5 pr-1 overscroll-contain">
+                        {filteredNotifs.map((item) => {
                           if (item.isSystemNotif) {
                             return (
                               <div 
                                 key={item.id} 
                                 onClick={() => handleSystemNotifClick(item)}
-                                className={`p-2.5 rounded-[12px] border text-xs flex flex-col gap-1 transition-all cursor-pointer ${
+                                className={`p-2.5 rounded-[12px] border text-xs flex flex-col gap-1.5 transition-all cursor-pointer hover:border-brand-primary/40 ${
                                   !item.read 
-                                    ? "bg-brand-primary/10 border-brand-primary/20 shadow-sm" 
+                                    ? "bg-brand-primary/10 border-brand-primary/25 shadow-xs" 
                                     : "bg-bg-base/30 border-border-card"
                                 }`}
                               >
-                                <div className="flex justify-between items-center">
-                                  <span className="font-extrabold text-text-main truncate max-w-[150px]">{item.title}</span>
-                                  {!item.read && (
-                                    <div className="flex items-center gap-2">
-                                      <span className="bg-brand-primary text-white text-[8px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider animate-pulse">NEW</span>
-                                      <button 
-                                        onClick={(e) => { e.stopPropagation(); markNotificationRead(item.id); }}
-                                        className="p-1 text-text-mut hover:text-brand-primary hover:bg-brand-primary/10 rounded transition-colors cursor-pointer"
-                                        title="Mark as read"
-                                      >
-                                        <Check size={12} />
-                                      </button>
-                                    </div>
-                                  )}
+                                <div className="flex justify-between items-start gap-1">
+                                  <span className="font-extrabold text-text-main leading-tight line-clamp-1">{item.title}</span>
+                                  <div className="flex items-center gap-1 flex-shrink-0">
+                                    {!item.read && (
+                                      <>
+                                        <span className="bg-brand-primary text-white text-[8px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider animate-pulse">NEW</span>
+                                        <button 
+                                          onClick={(e) => { e.stopPropagation(); markNotificationRead(item.id); }}
+                                          className="p-1 text-text-mut hover:text-brand-primary hover:bg-brand-primary/10 rounded transition-colors cursor-pointer"
+                                          title="Mark as read"
+                                        >
+                                          <Check size={12} />
+                                        </button>
+                                      </>
+                                    )}
+                                    <button
+                                      onClick={(e) => handleDeleteSystemNotif(e, item.id)}
+                                      className="p-1 text-text-mut hover:text-red-500 hover:bg-red-500/10 rounded transition-colors cursor-pointer ml-0.5"
+                                      title="Delete Notification"
+                                    >
+                                      <Trash2 size={12} />
+                                    </button>
+                                  </div>
                                 </div>
-                                <p className="text-[10px] text-text-sec">{item.message}</p>
-                                <span className="text-[8px] text-text-mut self-end mt-0.5 font-semibold">
-                                  {new Date(item.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                <p className="text-[11px] text-text-sec leading-relaxed">{item.message}</p>
+                                <span className="text-[9px] text-text-mut self-end mt-0.5 font-bold tracking-tight">
+                                  {formatNotifDateTime(item)}
                                 </span>
                               </div>
                             );
@@ -1565,14 +1679,14 @@ export default function DashboardLayout({ children }) {
                                   else navigate("/history");
                                   setShowNotifications(false);
                                 }}
-                                className={`p-2.5 rounded-[12px] border text-xs flex flex-col gap-1 transition-all cursor-pointer hover:bg-bg-base/40 ${
+                                className={`p-2.5 rounded-[12px] border text-xs flex flex-col gap-1.5 transition-all cursor-pointer hover:bg-bg-base/40 hover:border-brand-primary/40 ${
                                   isNewUpdate 
-                                    ? "bg-brand-primary/10 border-brand-primary/20 shadow-sm" 
+                                    ? "bg-brand-primary/10 border-brand-primary/25 shadow-xs" 
                                     : "bg-bg-base/30 border-border-card"
                                 }`}
                               >
-                                <div className="flex justify-between items-center">
-                                  <span className="font-extrabold text-text-main truncate max-w-[150px]">{req.type}</span>
+                                <div className="flex justify-between items-center gap-1">
+                                  <span className="font-extrabold text-text-main leading-tight line-clamp-1">{req.type}</span>
                                   <div className="flex items-center gap-1 flex-shrink-0">
                                     {isNewUpdate && (
                                       <span className="bg-brand-primary text-white text-[8px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider animate-pulse">NEW</span>
@@ -1589,7 +1703,7 @@ export default function DashboardLayout({ children }) {
                                     </button>
                                   </div>
                                 </div>
-                                <p className="text-[10px] text-text-sec">
+                                <p className="text-[11px] text-text-sec leading-relaxed">
                                   {currentUser?.role === "admin" 
                                     ? `${req.userName} requested ${req.type} (${req.duration}).`
                                     : `Your ${req.type} request for ${req.duration} was ${req.status}.`}
@@ -1599,8 +1713,8 @@ export default function DashboardLayout({ children }) {
                                     Comment: "{req.managerComment}"
                                   </p>
                                 )}
-                                <span className="text-[8px] text-text-mut self-end mt-0.5 font-semibold">
-                                  {new Date(req.updatedAt || req.createdAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                <span className="text-[9px] text-text-mut self-end mt-0.5 font-bold tracking-tight">
+                                  {formatNotifDateTime(req)}
                                 </span>
                               </div>
                             );

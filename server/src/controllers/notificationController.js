@@ -8,7 +8,7 @@ export const getNotifications = async (req, res) => {
     }
 
     const result = await query(
-      "SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100",
+      "SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500",
       [userId]
     );
 
@@ -21,7 +21,9 @@ export const getNotifications = async (req, res) => {
       type: r.type || "info",
       read: Boolean(r.read),
       link: r.link || "",
-      createdAt: r.created_at
+      createdAt: r.created_at,
+      created_at: r.created_at,
+      timestamp: r.created_at
     }));
 
     res.json(formatted);
@@ -56,7 +58,9 @@ export const createNotification = async (req, res) => {
       type: row.type,
       read: row.read,
       link: row.link,
-      createdAt: row.created_at
+      createdAt: row.created_at,
+      created_at: row.created_at,
+      timestamp: row.created_at
     };
 
     // Broadcast live socket event if io is available
@@ -100,5 +104,16 @@ export const markAllNotificationsAsRead = async (req, res) => {
   } catch (err) {
     console.error("markAllNotificationsAsRead error:", err);
     res.status(500).json({ error: "Failed to mark all notifications as read." });
+  }
+};
+
+export const deleteNotification = async (req, res) => {
+  try {
+    const { id } = req.params;
+    await query("DELETE FROM notifications WHERE id = $1", [id]);
+    res.json({ success: true, message: "Notification deleted successfully." });
+  } catch (err) {
+    console.error("deleteNotification error:", err);
+    res.status(500).json({ error: "Failed to delete notification." });
   }
 };

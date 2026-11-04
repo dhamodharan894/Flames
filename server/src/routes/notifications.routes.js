@@ -3,7 +3,8 @@ import {
   getNotifications,
   createNotification,
   markNotificationAsRead,
-  markAllNotificationsAsRead
+  markAllNotificationsAsRead,
+  deleteNotification
 } from "../controllers/notificationController.js";
 import { authenticateToken } from "../middlewares/auth.js";
 
@@ -14,5 +15,6 @@ router.get("/", getNotifications);
 router.post("/", createNotification);
 router.patch("/:id/read", markNotificationAsRead);
 router.post("/read-all", markAllNotificationsAsRead);
+router.delete("/:id", deleteNotification);
 
 export default router;
