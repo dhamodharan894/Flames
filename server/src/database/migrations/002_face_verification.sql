@@ -140,6 +140,41 @@ CREATE INDEX IF NOT EXISTS idx_avs_status        ON attendance_verification_sess
 CREATE INDEX IF NOT EXISTS idx_avs_token_hash    ON attendance_verification_sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_avs_token_action  ON attendance_verification_sessions(token_hash, action_type);
 
+-- 2A. FACE RE-ENROLLMENT REQUESTS
+-- Tracks employee-initiated re-enrollment permission requests and admin decisions.
+CREATE TABLE IF NOT EXISTS face_reenrollment_requests (
+    id                     TEXT PRIMARY KEY,
+    employee_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company_id             TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    reason                 TEXT NOT NULL,
+    status                 VARCHAR(20) NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending', 'approved', 'rejected')),
+    requested_at           TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_by            TEXT REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at            TIMESTAMPTZ,
+    rejection_reason       TEXT,
+    permission_expires_at  TIMESTAMPTZ,
+    used_at                TIMESTAMPTZ,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS employee_id TEXT;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS company_id TEXT;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending';
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS permission_expires_at TIMESTAMPTZ;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE face_reenrollment_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS idx_face_reenroll_employee_company ON face_reenrollment_requests(employee_id, company_id, status, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_face_reenroll_company_status ON face_reenrollment_requests(company_id, status, requested_at DESC);
+
 -- ============================================================================
 -- END OF MIGRATION 002
 -- ============================================================================

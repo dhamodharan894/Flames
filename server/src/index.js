@@ -5,6 +5,8 @@ import dotenv from "dotenv";
 import { setSecuritySocketIO } from "./services/securityDetector.js";
 import { ensureFaceService, stopFaceServiceProcess } from "./services/faceServiceManager.js";
 import { runGeofenceDefaultsMigration } from "../scripts/migrate-geofence-defaults.js";
+import { runAttendanceSessionsMigration } from "../scripts/migrate-attendance-sessions.js";
+import { runFaceReenrollmentMigration } from "../scripts/migrate-face-reenrollment.js";
 import { startComplianceSupervisor } from "./services/complianceSupervisor.js";
 
 dotenv.config();
@@ -96,11 +98,13 @@ async function startServer() {
     console.warn(`⚠️ [FaceService] Biometric attendance operations will fail-closed (503) until the service is restored.`);
   }
 
-  // 2. Run geofence defaults migration (non-blocking)
+  // 2. Run database migrations (non-blocking)
   try {
     await runGeofenceDefaultsMigration();
+    await runAttendanceSessionsMigration();
+    await runFaceReenrollmentMigration();
   } catch (migErr) {
-    console.warn(`⚠️ [Migration] Geofence defaults migration check: ${migErr.message}`);
+    console.warn(`⚠️ [Migration] Migration check note: ${migErr.message}`);
   }
 
   // 3. Start Express server

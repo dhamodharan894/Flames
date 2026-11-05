@@ -1,10 +1,34 @@
-
 // ============================================================================
 // HRMS POSTGRESQL DIRECT BACKEND CLIENT LAYER (ZERO FIRESTORE DEPENDENCY)
 // ============================================================================
 
 const PRODUCTION_API_URL = "https://attendance-cgs-production.up.railway.app/api";
-const LOCAL_API_URL = "http://localhost:5001/api";
+const LOCAL_API_PORTS = [5001, 5002, 5003, 5004, 5005, 3001, 8080];
+
+const buildCandidateUrls = (endpoint) => {
+  const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+  const candidateUrls = [];
+
+  if (import.meta.env.VITE_API_URL) {
+    const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
+    candidateUrls.push(`${envBase}${cleanEndpoint}`);
+  }
+
+  if (isLocal) {
+    for (const port of LOCAL_API_PORTS) {
+      candidateUrls.push(`http://localhost:${port}/api${cleanEndpoint}`);
+      candidateUrls.push(`http://127.0.0.1:${port}/api${cleanEndpoint}`);
+    }
+  } else {
+    candidateUrls.push(`${PRODUCTION_API_URL}${cleanEndpoint}`);
+    if (typeof window !== "undefined" && window.location.origin) {
+      candidateUrls.push(`${window.location.origin}/api${cleanEndpoint}`);
+    }
+  }
+
+  return [...new Set(candidateUrls)];
+};
 
 const getHeaders = () => {
   const token = localStorage.getItem("att_auth_token");
@@ -16,32 +40,13 @@ const getHeaders = () => {
 
 // Resilient API Fetch with Centralized Local (Port 5001) & Railway auto-fallback
 export const apiFetch = async (endpoint, options = {}) => {
-  const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
   const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-
-  // Determine candidate URLs (prioritize configured VITE_API_URL, then local port 5001)
-  const candidateUrls = [];
-  if (import.meta.env.VITE_API_URL) {
-    const envBase = import.meta.env.VITE_API_URL.replace(/\/+$/, "");
-    candidateUrls.push(`${envBase}${cleanEndpoint}`);
-  }
-
-  if (isLocal) {
-    candidateUrls.push(`http://localhost:5001/api${cleanEndpoint}`);
-    candidateUrls.push(`http://127.0.0.1:5001/api${cleanEndpoint}`);
-  } else {
-    candidateUrls.push(`${PRODUCTION_API_URL}${cleanEndpoint}`);
-    if (typeof window !== "undefined" && window.location.origin) {
-      candidateUrls.push(`${window.location.origin}/api${cleanEndpoint}`);
-    }
-  }
-
-  // Remove duplicates
-  const uniqueUrls = [...new Set(candidateUrls)];
+  const uniqueUrls = buildCandidateUrls(endpoint);
 
   let lastError = null;
 
-  for (const url of uniqueUrls) {
+  for (let index = 0; index < uniqueUrls.length; index += 1) {
+    const url = uniqueUrls[index];
     try {
       const response = await fetch(url, {
         ...options,
@@ -53,8 +58,10 @@ export const apiFetch = async (endpoint, options = {}) => {
 
       const contentType = response.headers.get("content-type") || "";
 
-      // If server returned HTML (e.g. AirTunes 403 or SPA fallback index.html for unhandled /api route) or 405 Method Not Allowed,
-      // this server doesn't host the real API; continue to the next candidate server.
+      if ((response.status === 404 || response.status === 405) && isLocal && index < uniqueUrls.length - 1) {
+        continue;
+      }
+
       if (response.status === 405 || (!contentType.includes("application/json") && response.ok) || (!contentType.includes("application/json") && response.status === 403)) {
         continue;
       }
@@ -63,8 +70,6 @@ export const apiFetch = async (endpoint, options = {}) => {
         return await response.json();
       }
 
-      // If the API server returned a structured JSON response (400, 401, 403, 429, 500, etc.),
-      // it is a real response from the HRMS backend - parse and throw immediately.
       if (contentType.includes("application/json")) {
         const err = await response.json().catch(() => ({ error: response.statusText }));
         const apiError = new Error(err.error || err.message || `Request failed with status ${response.status}`);
@@ -72,7 +77,10 @@ export const apiFetch = async (endpoint, options = {}) => {
         apiError.status = response.status;
         apiError.code = err.code;
 
-        // Auto-redirect if session was revoked remotely
+        if ((response.status === 404 || response.status === 405) && isLocal && index < uniqueUrls.length - 1) {
+          continue;
+        }
+
         if (response.status === 401 && (err.code === "SESSION_REVOKED" || (err.error && err.error.includes("Session has been revoked")))) {
           localStorage.removeItem("att_auth_token");
           localStorage.removeItem("att_current_user");
@@ -409,16 +417,33 @@ export const checkIn = async (userId, location = {}, verificationSessionToken = 
 };
 
 export const checkOut = async (userId, location = {}, verificationSessionToken = null) => {
-  const uid = typeof userId === "object" && userId !== null ? (userId.uid || userId.id) : userId;
-  const companyId = typeof userId === "object" && userId !== null ? userId.companyId : undefined;
+  let cur = null;
+  try {
+    cur = JSON.parse(localStorage.getItem("att_current_user") || "null");
+  } catch {}
+
+  const uid = typeof userId === "object" && userId !== null 
+    ? (userId.uid || userId.id) 
+    : (userId || cur?.uid || cur?.id);
+  const companyId = typeof userId === "object" && userId !== null 
+    ? (userId.companyId || userId.company_id) 
+    : (cur?.companyId || cur?.company_id);
   const date = getLocalDateString();
   const token = typeof location === "object" && location?.verificationSessionToken
     ? location.verificationSessionToken
     : verificationSessionToken;
-  return apiFetch("/attendance/check-out", {
+
+  const result = await apiFetch("/attendance/check-out", {
     method: "POST",
     body: JSON.stringify({ userId: uid, companyId, date, location, verificationSessionToken: token })
   });
+
+  // Stop any active task timers when user clocks out
+  try {
+    await stopAllTaskTimers(uid);
+  } catch {}
+
+  return result;
 };
 
 export const startBreak = async (userId, breakType = "short", location = {}) => {
@@ -939,7 +964,8 @@ export const updateTaskWarningSent = async (userId, taskId) => {
     const tasks = user?.tasks || [];
     const updatedTasks = tasks.map(t => {
       if (t.id === taskId) {
-        return { ...t, warningSentAt: new Date().toISOString() };
+        const nowIso = new Date().toISOString();
+        return { ...t, warningSentAt: nowIso, lastWarningSentAt: nowIso };
       }
       return t;
     });
@@ -2130,6 +2156,35 @@ export const reviewVerificationAttempt = async (attemptIdOrObj, decisionArg, not
   return apiFetch("/attendance/face/review", {
     method: "POST",
     body: JSON.stringify({ attemptId, decision, note })
+  });
+};
+
+export const requestFaceReenrollment = async (reason) => {
+  return apiFetch("/attendance/face-reenrollment/request", {
+    method: "POST",
+    body: JSON.stringify({ reason })
+  });
+};
+
+export const getMyFaceReenrollmentRequest = async () => {
+  return apiFetch("/attendance/face-reenrollment/my-request");
+};
+
+export const getFaceReenrollmentRequests = async (status = "") => {
+  const url = status ? `/attendance/face-reenrollment/requests?status=${encodeURIComponent(status)}` : "/attendance/face-reenrollment/requests";
+  return apiFetch(url);
+};
+
+export const approveFaceReenrollmentRequest = async (requestId) => {
+  return apiFetch(`/attendance/face-reenrollment/${encodeURIComponent(requestId)}/approve`, {
+    method: "PUT"
+  });
+};
+
+export const rejectFaceReenrollmentRequest = async (requestId, rejectionReason = "") => {
+  return apiFetch(`/attendance/face-reenrollment/${encodeURIComponent(requestId)}/reject`, {
+    method: "PUT",
+    body: JSON.stringify({ rejectionReason })
   });
 };
 

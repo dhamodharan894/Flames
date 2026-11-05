@@ -40,6 +40,30 @@ export const createNotification = async (req, res) => {
       return res.status(400).json({ error: "userId, title, and message are required." });
     }
 
+    // Deduplication check: prevent duplicate notifications
+    const existing = await query(
+      `SELECT * FROM notifications WHERE user_id = $1 AND title = $2 AND message = $3 LIMIT 1`,
+      [userId, title, message]
+    );
+
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      return res.json({
+        id: row.id,
+        _id: row.id,
+        userId: row.user_id,
+        title: row.title,
+        message: row.message,
+        type: row.type,
+        read: row.read,
+        link: row.link,
+        createdAt: row.created_at,
+        created_at: row.created_at,
+        timestamp: row.created_at,
+        duplicate: true
+      });
+    }
+
     const id = "notif_" + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
     const result = await query(
       `INSERT INTO notifications (id, user_id, title, message, type, read, link)

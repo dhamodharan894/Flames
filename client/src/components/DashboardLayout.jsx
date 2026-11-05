@@ -442,45 +442,54 @@ export default function DashboardLayout({ children }) {
     return unsub;
   }, [currentUser?.uid]);
 
-  // Check for missing hourly task reports
+  // Check for missing hourly task reports (at most 1 notification per task; skips expired/locked tasks)
   useEffect(() => {
     if (!currentUser || !currentUser.tasks || currentUser.tasks.length === 0) return;
 
-    // Check every minute
-    const interval = setInterval(() => {
-      const activeTasks = currentUser.tasks.filter(t => !t.completed);
+    const checkMissingReports = () => {
+      const activeTasks = currentUser.tasks.filter(t => !t.completed && t.status !== "completed" && t.status !== "cancelled");
       const now = Date.now();
       
       activeTasks.forEach(async (task) => {
-        const lastActionTime = new Date(task.lastReportedAt || task.assignedAt).getTime();
+        // Skip tasks that are already locked or whose deadline has expired
+        const isDeadlineExpired = task.deadline && new Date(task.deadline).getTime() < now;
+        if (task.isLocked || isDeadlineExpired) return;
+
+        // One notification is enough: check if this task was already warned
+        const storageKey = `hourly_report_warned_${currentUser.uid}_${task.id}`;
+        if (localStorage.getItem(storageKey)) return;
+        if (task.warningSentAt || task.lastWarningSentAt) {
+          localStorage.setItem(storageKey, "true");
+          return;
+        }
+
+        const lastActionTime = new Date(task.lastReportedAt || task.assignedAt || task.createdAt || now).getTime();
         const hoursSinceAction = (now - lastActionTime) / (1000 * 60 * 60);
         
-        // If more than 2 hours passed since last report/assignment
+        // If more than 2 hours passed since last report/assignment, send exactly 1 notification
         if (hoursSinceAction > 2) {
-          const lastWarningTime = task.lastWarningSentAt ? new Date(task.lastWarningSentAt).getTime() : 0;
-          const hoursSinceWarning = (now - lastWarningTime) / (1000 * 60 * 60);
-          
-          // Only send warning if we haven't sent one in the last 2 hours
-          if (hoursSinceWarning > 2) {
-            try {
-              await createNotification(
-                currentUser.uid,
-                "Missing Hourly Report",
-                `Reminder: You have not submitted an hourly update for task "${task.title}" in over 2 hours!`,
-                "warning",
-                "/dashboard?tab=tasks"
-              );
-              await updateTaskWarningSent(currentUser.uid, task.id);
-            } catch (err) {
-              console.error("Failed to send task warning notification", err);
-            }
+          localStorage.setItem(storageKey, "true");
+          try {
+            await createNotification(
+              currentUser.uid,
+              "Missing Hourly Report",
+              `Reminder: You have not submitted an hourly update for task "${task.title}" in over 2 hours!`,
+              "warning",
+              "/task-management"
+            );
+            await updateTaskWarningSent(currentUser.uid, task.id);
+          } catch (err) {
+            console.error("Failed to send task warning notification", err);
           }
         }
       });
-    }, 60000); // 1 minute interval
+    };
+
+    checkMissingReports();
+    const interval = setInterval(checkMissingReports, 300000); // Check once every 5 minutes
 
     return () => clearInterval(interval);
-  }, [currentUser]);
+  }, [currentUser?.tasks, currentUser?.uid]);
 
   const handleOpenNotifications = () => {
     setShowNotifications(!showNotifications);
@@ -660,19 +669,8 @@ export default function DashboardLayout({ children }) {
   };
 
   const handleQuickCheckOut = async () => {
-    setLoadingAction(true);
-    try {
-      showToast("Fetching location...", "info", 1500);
-      const loc = await getGpsLocation();
-      await checkOut(currentUser.uid, loc);
-      showToast("Checked out successfully!", "success");
-      setShowQuickCheckModal(false);
-      window.location.reload();
-    } catch (err) {
-      showToast(err.message || "Quick check-out failed", "error");
-    } finally {
-      setLoadingAction(false);
-    }
+    setShowQuickCheckModal(false);
+    navigate("/dashboard?action=checkout");
   };
 
   const isAdmin = currentUser?.role === "admin" || currentUser?.email === "admin@teamcarrezza.com";

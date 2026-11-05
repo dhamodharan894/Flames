@@ -13,6 +13,11 @@ import {
   authorizeFaceEnrollment,
   enrollFace,
   revokeFaceEnrollment,
+  requestFaceReenrollment,
+  getMyFaceReenrollmentRequest,
+  getFaceReenrollmentRequests,
+  approveFaceReenrollmentRequest,
+  rejectFaceReenrollmentRequest,
   getVerificationAttempts,
   reviewVerificationAttempt,
   createVerificationSession,
@@ -44,6 +49,11 @@ router.get("/face/status", getFaceStatus);
 router.post("/face/authorize", authorizeFaceEnrollment);
 router.post("/face/enroll", enrollFace);
 router.post("/face/revoke", revokeFaceEnrollment);
+router.post("/face-reenrollment/request", requestFaceReenrollment);
+router.get("/face-reenrollment/my-request", getMyFaceReenrollmentRequest);
+router.get("/face-reenrollment/requests", getFaceReenrollmentRequests);
+router.put("/face-reenrollment/:id/approve", approveFaceReenrollmentRequest);
+router.put("/face-reenrollment/:id/reject", rejectFaceReenrollmentRequest);
 router.post("/face/verify-session", createVerificationSession);
 router.get("/face/attempts", getVerificationAttempts);
 router.post("/face/review", reviewVerificationAttempt);

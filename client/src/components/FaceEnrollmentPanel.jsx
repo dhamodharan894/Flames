@@ -5,7 +5,10 @@ import {
   enrollFace,
   getFaceEnrollmentStatus,
   getVerificationAttempts,
-  reviewVerificationAttempt
+  reviewVerificationAttempt,
+  getFaceReenrollmentRequests,
+  approveFaceReenrollmentRequest,
+  rejectFaceReenrollmentRequest
 } from "../firebase";
 import {
   Shield,
@@ -33,9 +36,12 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
   const [selectedId, setSelectedId] = useState("");
   const [consentRecorded, setConsentRecorded] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
+  const [replacementTarget, setReplacementTarget] = useState(null);
+  const [isReplacementSession, setIsReplacementSession] = useState(false);
   const [busy, setBusy] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const staffList = useMemo(() => Array.isArray(users) ? users : [], [users]);
 
   // Verification Review Queue States
   const [attempts, setAttempts] = useState([]);
@@ -47,58 +53,45 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
   const [reviewNote, setReviewNote] = useState("");
   const [submittingReview, setSubmittingReview] = useState(false);
 
-  // Filter active staff members
-  const staffList = useMemo(
-    () => (users || []).filter(u => {
-      const status = (u.status || "active").toLowerCase();
-      const role = (u.role || "employee").toLowerCase();
-      return status !== "inactive" && role !== "admin" && role !== "superadmin";
-    }),
-    [users]
-  );
+  // Re-enrollment Requests States
+  const [reenrollmentRequests, setReenrollmentRequests] = useState([]);
+  const [requestsLoading, setRequestsLoading] = useState(false);
+  const [requestStatusFilter, setRequestStatusFilter] = useState("pending");
+  const [requestSearch, setRequestSearch] = useState("");
+  const [processingRequestId, setProcessingRequestId] = useState(null);
+  const [rejectionReason, setRejectionReason] = useState("");
+  const [selectedRequestForReview, setSelectedRequestForReview] = useState(null);
 
   useEffect(() => {
-    setEmployees(staffList);
-  }, [staffList]);
+    if (!staffList.length) return;
 
-  // Load enrollment statuses for all visible employees
-  useEffect(() => {
     let cancelled = false;
-    const loadStatuses = async () => {
-      const map = {};
+    const loadEnrollmentStatuses = async () => {
+      const nextStatuses = {};
+
       for (const emp of staffList) {
-        const id = emp.uid || emp.id;
+        const userId = emp.uid || emp.id;
+        if (!userId) continue;
+
         try {
-          const res = await getFaceEnrollmentStatus(id);
-          map[id] = res;
+          const status = await getFaceEnrollmentStatus(userId);
+          nextStatuses[userId] = status || { enrollment_status: "pending", metadata: {} };
         } catch {
-          map[id] = { enrollment_status: "pending" };
+          nextStatuses[userId] = { enrollment_status: "pending", metadata: {} };
         }
       }
-      if (!cancelled) setEnrollmentStatuses(map);
+
+      if (!cancelled) {
+        setEnrollmentStatuses(nextStatuses);
+      }
     };
-    if (staffList.length > 0) {
-      loadStatuses();
-    }
+
+    loadEnrollmentStatuses();
     return () => {
       cancelled = true;
     };
   }, [staffList]);
 
-  // Handle URL preselection for employee (e.g., from Staff Directory)
-  useEffect(() => {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const uidFromUrl = params.get("userId");
-      if (uidFromUrl) {
-        setSelectedId(uidFromUrl);
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  // Fetch verification attempts
   const loadAttempts = async () => {
     setAttemptsLoading(true);
     try {
@@ -111,9 +104,25 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
     }
   };
 
+  const loadReenrollmentRequests = async (status = requestStatusFilter) => {
+    setRequestsLoading(true);
+    try {
+      const data = await getFaceReenrollmentRequests(status === "all" ? "" : status);
+      setReenrollmentRequests(Array.isArray(data) ? data : []);
+    } catch (err) {
+      showToast(err.message || "Failed to load face re-enrollment requests.", "error");
+    } finally {
+      setRequestsLoading(false);
+    }
+  };
+
   useEffect(() => {
     loadAttempts();
   }, []);
+
+  useEffect(() => {
+    loadReenrollmentRequests(requestStatusFilter);
+  }, [requestStatusFilter]);
 
   const selectedEmployee = staffList.find(u => (u.uid || u.id) === selectedId);
   const selectedStatus = selectedId ? enrollmentStatuses[selectedId] : null;
@@ -140,10 +149,27 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
     }
   };
 
-  const handleStartCaptureForEmployee = (emp) => {
+  const handleInitiateEnrollment = (emp) => {
+    if (!emp) return;
     const id = emp.uid || emp.id;
+    const isEnrolled = enrollmentStatuses[id]?.enrollment_status === "enrolled";
     setSelectedId(id);
+    if (isEnrolled) {
+      setReplacementTarget(emp);
+    } else {
+      setIsReplacementSession(false);
+      setConsentRecorded(true);
+      setShowCamera(true);
+    }
+  };
+
+  const handleConfirmReplacement = () => {
+    if (!replacementTarget) return;
+    const id = replacementTarget.uid || replacementTarget.id;
+    setSelectedId(id);
+    setIsReplacementSession(true);
     setConsentRecorded(true);
+    setReplacementTarget(null);
     setShowCamera(true);
   };
 
@@ -151,20 +177,40 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
     if (!selectedId) return;
     setBusy(true);
     try {
-      await enrollFace(imageBase64, consentRecorded, selectedId);
+      const res = await enrollFace(imageBase64, consentRecorded, selectedId);
       setShowCamera(false);
-      setEnrollmentStatuses(prev => ({
-        ...prev,
-        [selectedId]: {
-          ...(prev[selectedId] || {}),
-          enrollment_status: "enrolled"
-        }
-      }));
       setConsentRecorded(false);
-      showToast("Biometric enrollment template saved. Raw image was not stored.", "success");
+
+      // Refresh employee's biometric status and enrollment timestamp
+      try {
+        const refreshedStatus = await getFaceEnrollmentStatus(selectedId);
+        setEnrollmentStatuses(prev => ({
+          ...prev,
+          [selectedId]: refreshedStatus
+        }));
+      } catch {
+        setEnrollmentStatuses(prev => ({
+          ...prev,
+          [selectedId]: {
+            ...(prev[selectedId] || {}),
+            enrollment_status: "enrolled",
+            enrolled_at: res?.enrolled_at || new Date().toISOString()
+          }
+        }));
+      }
+
+      const empObj = staffList.find(u => (u.uid || u.id) === selectedId) || selectedEmployee;
+      const empName = empObj?.name || "Employee";
+
+      if (res?.mode === "replacement" || isReplacementSession) {
+        showToast(`Face template successfully replaced and validated for ${empName}.`, "success");
+      } else {
+        showToast(`Biometric enrollment template saved for ${empName}. Raw image was not stored.`, "success");
+      }
     } catch (err) {
       showToast(err.message || "Face enrollment failed.", "error");
     } finally {
+      setIsReplacementSession(false);
       setBusy(false);
     }
   };
@@ -204,6 +250,40 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
       showToast(err.message || "Failed to submit review decision.", "error");
     } finally {
       setSubmittingReview(false);
+    }
+  };
+
+  const handleApproveRequest = async (requestId) => {
+    if (!requestId) return;
+    setProcessingRequestId(requestId);
+    try {
+      const res = await approveFaceReenrollmentRequest(requestId);
+      setReenrollmentRequests(prev =>
+        prev.map(item => item.id === requestId ? { ...item, ...res?.request, status: "approved" } : item)
+      );
+      showToast("Face re-enrollment request approved.", "success");
+    } catch (err) {
+      showToast(err.message || "Failed to approve the request.", "error");
+    } finally {
+      setProcessingRequestId(null);
+    }
+  };
+
+  const handleRejectRequest = async (requestId, reasonOverride = "") => {
+    if (!requestId) return;
+    setProcessingRequestId(requestId);
+    try {
+      const res = await rejectFaceReenrollmentRequest(requestId, reasonOverride || rejectionReason || "Not provided");
+      setReenrollmentRequests(prev =>
+        prev.map(item => item.id === requestId ? { ...item, ...res?.request, status: "rejected" } : item)
+      );
+      setRejectionReason("");
+      setSelectedRequestForReview(null);
+      showToast("Face re-enrollment request rejected.", "success");
+    } catch (err) {
+      showToast(err.message || "Failed to reject the request.", "error");
+    } finally {
+      setProcessingRequestId(null);
     }
   };
 
@@ -297,14 +377,86 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
 
   return (
     <div className="space-y-6">
+      {/* Biometric Template Replacement Confirmation Modal */}
+      {replacementTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+          <div className="bg-bg-card border border-border-card rounded-[24px] max-w-lg w-full p-6 shadow-2xl space-y-5">
+            <div className="flex items-start gap-4">
+              <div className="p-3 rounded-2xl bg-amber-500/10 text-amber-500 flex-shrink-0">
+                <AlertTriangle size={24} />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-base font-bold text-text-main">
+                  Replace Face Reference Template
+                </h3>
+                <p className="text-xs text-text-mut">
+                  Biometric Reference Update Confirmation
+                </p>
+              </div>
+            </div>
+
+            {/* Employee Quick Summary */}
+            <div className="bg-bg-base/60 border border-border-card rounded-2xl p-3.5 flex items-center justify-between">
+              <div>
+                <div className="text-xs font-bold text-text-main">{replacementTarget.name}</div>
+                <div className="text-[11px] text-text-sec">{replacementTarget.email}</div>
+              </div>
+              <div className="text-right">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-600 border border-emerald-500/20">
+                  Currently Enrolled
+                </span>
+                {enrollmentStatuses[replacementTarget.uid || replacementTarget.id]?.enrolled_at && (
+                  <div className="text-[10px] text-text-mut mt-1">
+                    Enrolled: {formatTimestamp(enrollmentStatuses[replacementTarget.uid || replacementTarget.id]?.enrolled_at)}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Confirmation Message */}
+            <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-700 dark:text-amber-400 space-y-2">
+              <p className="font-semibold text-text-main">
+                This employee already has a registered face template. Continuing will replace the existing reference template with the newly captured face.
+              </p>
+              <p className="text-[11px] text-text-sec">
+                The newly captured selfie will be validated with ArcFace face detection, and the resulting mathematical embedding will replace the existing reference vector. Existing biometric consent, attendance logs, and audit records will remain intact.
+              </p>
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setReplacementTarget(null)}
+                disabled={busy}
+                className="px-4 py-2 text-xs font-bold rounded-xl border border-border-card text-text-sec hover:text-text-main hover:bg-bg-hover transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmReplacement}
+                disabled={busy}
+                className="px-4 py-2 text-xs font-bold rounded-xl bg-brand-primary text-white hover:bg-brand-hover transition-colors flex items-center gap-2 shadow-sm"
+              >
+                <Camera size={14} />
+                <span>Continue to Camera Capture</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Active Camera Capture Modal */}
       {showCamera && (
         <CameraCapture
-          title={`Enroll Face: ${selectedEmployee?.name || "Employee"}`}
-          description="Position the face in good lighting. Only one face should be visible."
+          title={isReplacementSession ? `Replace Face Template: ${selectedEmployee?.name || "Employee"}` : `Enroll Face: ${selectedEmployee?.name || "Employee"}`}
+          description={isReplacementSession ? "Position the employee centrally with good lighting. The newly validated face will replace the previous reference template." : "Position the face in good lighting. Only one face should be visible."}
+          captureLabel={isReplacementSession ? "Capture & Replace Template" : "Capture Selfie"}
           onCapture={handleCaptureComplete}
           onCancel={() => {
             setShowCamera(false);
+            setIsReplacementSession(false);
             setConsentRecorded(false);
           }}
           busy={busy}
@@ -399,12 +551,12 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleStartCaptureForEmployee(selectedEmployee)}
+                  onClick={() => handleInitiateEnrollment(selectedEmployee)}
                   disabled={busy}
                   className="px-4 py-2 text-xs font-bold rounded-xl bg-brand-primary text-white hover:bg-brand-hover transition-colors flex items-center gap-2 shadow-sm cursor-pointer disabled:opacity-50"
                 >
                   <Camera size={14} />
-                  <span>{selectedStatus?.enrollment_status === "enrolled" ? "Re-enroll Face" : "Capture & Enroll Face"}</span>
+                  <span>{selectedStatus?.enrollment_status === "enrolled" ? "Re-Enroll Face" : "Enroll Face"}</span>
                 </button>
                 <button
                   type="button"
@@ -576,12 +728,12 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
                               )}
                               <button
                                 type="button"
-                                onClick={() => handleStartCaptureForEmployee(emp)}
+                                onClick={() => handleInitiateEnrollment(emp)}
                                 disabled={busy}
                                 className="px-3 py-1 text-[11px] font-bold rounded-lg bg-brand-primary text-white hover:bg-brand-hover transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
                               >
                                 <Camera size={13} />
-                                <span>{isEnrolled ? "Re-enroll" : "Enroll Face"}</span>
+                                <span>{isEnrolled ? "Re-Enroll Face" : "Enroll Face"}</span>
                               </button>
                             </div>
                           </td>
@@ -742,6 +894,7 @@ export default function FaceEnrollmentPanel({ users, showToast }) {
                                     ? "bg-amber-500/10 text-amber-600 border border-amber-500/20"
                                     : "bg-rose-500/10 text-rose-600 border border-rose-500/20"
                                 }`}
+                                title="Face Embedding Comparison"
                               >
                                 {attempt.status === "verified" && <CheckCircle2 size={11} />}
                                 {attempt.status === "inconclusive" && <AlertTriangle size={11} />}

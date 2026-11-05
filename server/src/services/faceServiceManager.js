@@ -13,6 +13,7 @@
  */
 
 import { spawn } from "child_process";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -69,6 +70,12 @@ export async function checkFaceServiceHealth(baseUrl = getFaceServiceUrl(), time
 export function resolvePythonCommand() {
   if (process.env.PYTHON_PATH) return process.env.PYTHON_PATH;
   if (process.env.PYTHON_CMD) return process.env.PYTHON_CMD;
+
+  const venvWin = path.resolve(defaultFaceServiceDir, ".venv/Scripts/python.exe");
+  const venvPosix = path.resolve(defaultFaceServiceDir, ".venv/bin/python");
+  if (fs.existsSync(venvWin)) return venvWin;
+  if (fs.existsSync(venvPosix)) return venvPosix;
+
   return process.platform === "win32" ? "python" : "python3";
 }
 

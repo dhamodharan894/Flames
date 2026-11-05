@@ -228,66 +228,108 @@ export default function UserDashboard() {
 
   const toastShownRef = useRef(false);
 
-  const isOnBreak = !!(todayLog && (
-    todayLog.status === "on-break" || 
-    (Array.isArray(todayLog.breaks) && todayLog.breaks.some(b => !b.end && !b.resumeTime))
-  ));
-  const isCheckedOut = !isOnBreak && !!(todayLog && (
+  const isCheckedOut = !!(todayLog && (
     todayLog.status === "checked-out" || 
     todayLog.status === "completed" || 
-    !!todayLog.check_out
+    !!todayLog.check_out ||
+    !!todayLog.checkOutTime ||
+    !!todayLog.checkOut
+  ));
+  const isOnBreak = !isCheckedOut && !!(todayLog && (
+    todayLog.status === "on-break" || 
+    (Array.isArray(todayLog.breaks) && todayLog.breaks.some(b => !b.end && !b.resumeTime))
   ));
   const isCheckedIn = !isOnBreak && !isCheckedOut && !!(todayLog && (
     todayLog.status === "checked-in" || 
     todayLog.status === "in-progress" || 
     todayLog.status === "present" || 
-    (todayLog.check_in && !todayLog.check_out)
+    (todayLog.check_in && !todayLog.check_out && !todayLog.checkOutTime && !todayLog.checkOut)
   ));
 
   const getElapsedWorkingMs = () => {
     if (!todayLog) return 0;
     
-    // If today is checked out and totalWorkingMinutes is calculated
-    if (isCheckedOut && todayLog.totalWorkingMinutes !== undefined) {
-      return (todayLog.totalWorkingMinutes || 0) * 60 * 1000;
+    // If today is checked out, freeze duration immediately at total completed duration and never use currentTime
+    if (isCheckedOut) {
+      if (todayLog.totalWorkingMinutes !== undefined && todayLog.totalWorkingMinutes !== null) {
+        return (Number(todayLog.totalWorkingMinutes) || 0) * 60 * 1000;
+      }
+      if (todayLog.duration_minutes !== undefined && todayLog.duration_minutes !== null) {
+        return (Number(todayLog.duration_minutes) || 0) * 60 * 1000;
+      }
+      if (Array.isArray(todayLog.sessions) && todayLog.sessions.length > 0) {
+        const totalSessionMins = todayLog.sessions.reduce((acc, s) => acc + (Number(s.durationMinutes) || 0), 0);
+        return totalSessionMins * 60 * 1000;
+      }
+      const activeIn = todayLog.latestCheckInTime || todayLog.lastCheckInTime || todayLog.checkInTime || todayLog.check_in;
+      const activeOut = todayLog.checkOutTime || todayLog.check_out;
+      if (activeIn && activeOut) {
+        const inD = new Date(activeIn);
+        const outD = new Date(activeOut);
+        if (!isNaN(inD) && !isNaN(outD) && outD >= inD) {
+          let breakMs = 0;
+          const bList = Array.isArray(todayLog.breaks) ? todayLog.breaks : [];
+          bList.forEach(b => {
+            const s = b.start || b.startTime;
+            const e = b.end || b.resumeTime;
+            if (s && e) {
+              breakMs += Math.max(0, new Date(e).getTime() - new Date(s).getTime());
+            }
+          });
+          const exactMs = Math.max(0, outD.getTime() - inD.getTime() - breakMs);
+          const accumulatedMs = (Number(todayLog.accumulatedWorkingMinutes) || 0) * 60 * 1000;
+          return accumulatedMs + exactMs;
+        }
+      }
+      return 0;
     }
 
-    const accumulatedMs = (todayLog.accumulatedWorkingMinutes || 0) * 60 * 1000;
+    // Active shift or On-Break
+    let accumulatedMs = 0;
+    let latestCheckIn = null;
+    let currentSessionBreaks = [];
 
-    const activeCheckIn = todayLog.lastCheckInTime || todayLog.checkInTime || todayLog.check_in;
-    if (!activeCheckIn) return accumulatedMs;
+    if (Array.isArray(todayLog.sessions) && todayLog.sessions.length > 0) {
+      // Completed sessions
+      const completedSessions = todayLog.sessions.filter(s => !!s.checkOut);
+      accumulatedMs = completedSessions.reduce((acc, s) => acc + (Number(s.durationMinutes) || 0), 0) * 60 * 1000;
 
-    const checkInDate = new Date(activeCheckIn);
-    const checkOutDate = (todayLog.checkOutTime || todayLog.check_out) ? new Date(todayLog.checkOutTime || todayLog.check_out) : currentTime;
-    
-    const sessionElapsedMs = checkOutDate.getTime() - checkInDate.getTime();
+      // Active session (open session without checkOut)
+      const activeS = todayLog.sessions.find(s => !s.checkOut) || todayLog.sessions[todayLog.sessions.length - 1];
+      if (activeS) {
+        latestCheckIn = activeS.checkIn;
+        currentSessionBreaks = Array.isArray(activeS.breaks) ? activeS.breaks : [];
+      }
+    } else {
+      accumulatedMs = (Number(todayLog.accumulatedWorkingMinutes) || 0) * 60 * 1000;
+      latestCheckIn = todayLog.latestCheckInTime || todayLog.lastCheckInTime || todayLog.checkInTime || todayLog.check_in;
+      currentSessionBreaks = Array.isArray(todayLog.currentSessionBreaks) ? todayLog.currentSessionBreaks : (Array.isArray(todayLog.breaks) ? todayLog.breaks : []);
+    }
+
+    if (!latestCheckIn) return accumulatedMs;
+
+    const checkInDate = new Date(latestCheckIn);
+    if (isNaN(checkInDate.getTime())) return accumulatedMs;
+
+    const sessionElapsedMs = Math.max(0, currentTime.getTime() - checkInDate.getTime());
     
     let breakMs = 0;
-    const activeBreaks = (todayLog.sessions && todayLog.sessions.length > 0)
-      ? (todayLog.currentSessionBreaks || [])
-      : (todayLog.breaks || []);
-
-    if (activeBreaks && activeBreaks.length > 0) {
-      activeBreaks.forEach(b => {
+    if (currentSessionBreaks && currentSessionBreaks.length > 0) {
+      currentSessionBreaks.forEach(b => {
         const bStart = b.start || b.startTime;
         const bEnd = b.end || b.resumeTime;
         if (bStart) {
           const start = new Date(bStart);
-          const resume = bEnd ? new Date(bEnd) : ((todayLog.checkOutTime || todayLog.check_out) ? new Date(todayLog.checkOutTime || todayLog.check_out) : currentTime);
-          breakMs += (resume.getTime() - start.getTime());
+          const resume = bEnd ? new Date(bEnd) : currentTime;
+          if (!isNaN(start.getTime()) && !isNaN(resume.getTime())) {
+            breakMs += Math.max(0, resume.getTime() - start.getTime());
+          }
         }
       });
     }
     
     const currentSessionWorkingMs = Math.max(0, sessionElapsedMs - breakMs);
-    const totalWorkingMs = accumulatedMs + currentSessionWorkingMs;
-
-    // If total working time exceeds 9 hours, cap at 8 hours
-    if (totalWorkingMs > 9 * 60 * 60 * 1000) {
-      return 8 * 60 * 60 * 1000;
-    }
-    
-    return totalWorkingMs;
+    return accumulatedMs + currentSessionWorkingMs;
   };
 
   const formatDuration = (ms) => {
@@ -358,24 +400,15 @@ export default function UserDashboard() {
     return `${formattedHours}:${formattedMinutes} ${ampm}`;
   };
 
-  // Ticking time effect
+  // Ticking time effect: only active when employee is actively checked in or on break
+  // Stops immediately on checkout or unmount
   useEffect(() => {
+    if (isCheckedOut || (!isCheckedIn && !isOnBreak)) {
+      return;
+    }
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-    
-  const handleDownloadPayslip = () => {
-    const element = document.getElementById('payslip-content');
-    const opt = {
-      margin:       0.5,
-      filename:     `Payslip_${currentUser?.name}_${selectedPayslip?.month}_${selectedPayslip?.year}.pdf`,
-      image:        { type: 'jpeg', quality: 0.98 },
-      html2canvas:  { scale: 2 },
-      jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
-    };
-    html2pdf().set(opt).from(element).save();
-  };
-
-  return () => clearInterval(timer);
-  }, []);
+    return () => clearInterval(timer);
+  }, [isCheckedIn, isOnBreak, isCheckedOut]);
 
   // Reset pagination on tab change
   useEffect(() => {
@@ -480,7 +513,7 @@ export default function UserDashboard() {
   // Handle countdown timer when user is on break
   useEffect(() => {
     const activeBreak = todayLog?.breaks?.find(b => !b.end && !b.resumeTime);
-    if (todayLog && (todayLog.status === "on-break" || activeBreak)) {
+    if (!isCheckedOut && todayLog && (todayLog.status === "on-break" || activeBreak)) {
       const bType = activeBreak?.breakType || activeBreak?.type || "short";
       let totalSeconds = 1800; // default 30 min
       if (bType === "bio") totalSeconds = 900; // 15 min
@@ -524,7 +557,7 @@ export default function UserDashboard() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [todayLog]);
+  }, [todayLog, isCheckedOut]);
 
   const refreshLocation = () => {
     setFetchingGps(true);
@@ -704,6 +737,13 @@ export default function UserDashboard() {
     setShowCheckoutConfirm(true);
   };
 
+  useEffect(() => {
+    const action = searchParams.get("action");
+    if (action === "checkout" && isCheckedIn) {
+      handleCheckOut();
+    }
+  }, [searchParams, isCheckedIn]);
+
   const confirmCheckOut = async () => {
     setShowCheckoutConfirm(false);
     setActionLoading(true);
@@ -765,10 +805,11 @@ export default function UserDashboard() {
         }
         showToast("Biometric verification verified! Checked in successfully.", "success");
       } else {
-        const res = await checkOut(currentUser.uid, biometricModal.location, verifyRes.verificationSessionToken);
+        const res = await checkOut(currentUser, biometricModal.location, verifyRes.verificationSessionToken);
         if (res) {
           setTodayLog(res);
         }
+        setUserTasks(prev => (prev || []).map(t => ({ ...t, timerStartedAt: null })));
         showToast("Biometric verification verified! Checked out successfully.", "success");
       }
 
@@ -945,29 +986,15 @@ export default function UserDashboard() {
   };
 
   const getShiftProgress = () => {
-    if (!todayLog || (!todayLog.checkInTime && !todayLog.lastCheckInTime)) return 0;
+    if (!todayLog || (!todayLog.checkInTime && !todayLog.lastCheckInTime && !todayLog.check_in)) return 0;
     const targetMin = getShiftDurationMinutes();
-    if (todayLog.status === "checked-out" && todayLog.totalWorkingMinutes !== undefined) {
-      return Math.min(100, Math.round((todayLog.totalWorkingMinutes / targetMin) * 100));
-    }
-
     const elapsedMs = getElapsedWorkingMs();
     const elapsedMinutes = elapsedMs / 60000;
     return Math.min(100, Math.round((elapsedMinutes / targetMin) * 100));
   };
 
   const getActiveHoursText = () => {
-    const formatTime = (minutes) => {
-      const h = Math.floor(minutes / 60);
-      const m = Math.floor(minutes % 60);
-      const s = Math.floor((minutes * 60) % 60);
-      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    };
-
-    if (!todayLog || (!todayLog.checkInTime && !todayLog.lastCheckInTime)) return "00:00:00";
-    if (todayLog.status === "checked-out" && todayLog.totalWorkingMinutes !== undefined) {
-      return formatTime(todayLog.totalWorkingMinutes);
-    }
+    if (!todayLog || (!todayLog.checkInTime && !todayLog.lastCheckInTime && !todayLog.check_in)) return "00:00:00";
     const elapsedMs = getElapsedWorkingMs();
     return formatDuration(elapsedMs);
   };
@@ -990,7 +1017,7 @@ export default function UserDashboard() {
       const log = userLogs.find(l => l.date === targetDateStr);
       let hrs = 0;
       if (log) {
-        if (targetDateStr === todayStr && log.status !== "checked-out") {
+        if (targetDateStr === todayStr && !isCheckedOut) {
           hrs = getElapsedWorkingMs() / (1000 * 60 * 60);
         } else {
           hrs = (log.totalWorkingMinutes || 0) / 60;
@@ -2244,16 +2271,16 @@ export default function UserDashboard() {
             </span>
           </div>
           <div className="flex items-center gap-3 text-xs font-mono font-bold text-text-sec">
-            {todayLog?.checkInTime && (
+            {(todayLog?.latestCheckInTime || todayLog?.checkInTime || todayLog?.check_in) && (
               <span className="flex items-center gap-1">
                 <Play size={10} className="text-brand-success" fill="currentColor" />
-                In: {new Date(todayLog.checkInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                In: {new Date(todayLog.latestCheckInTime || todayLog.lastCheckInTime || todayLog.checkInTime || todayLog.check_in).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               </span>
             )}
-            {todayLog?.checkOutTime && (
+            {isCheckedOut && (todayLog?.checkOutTime || todayLog?.check_out) && (
               <span className="flex items-center gap-1">
                 <Square size={10} className="text-brand-danger" fill="currentColor" />
-                Out: {new Date(todayLog.checkOutTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                Out: {new Date(todayLog.checkOutTime || todayLog.check_out).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               </span>
             )}
           </div>
@@ -2346,7 +2373,7 @@ export default function UserDashboard() {
                   </div>
                   <h3 className="text-xl font-bold text-text-main mb-1">Shift In Progress</h3>
                   <p className="text-sm text-text-sec mb-4">
-                    You checked in today at <strong className="text-text-main">{new Date(todayLog.checkInTime || todayLog.check_in || currentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong>.
+                    You checked in today at <strong className="text-text-main">{new Date(todayLog.latestCheckInTime || todayLog.lastCheckInTime || todayLog.checkInTime || todayLog.check_in || currentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong>.
                   </p>
 
                   {/* Digital Clock Shift Duration Ticker */}

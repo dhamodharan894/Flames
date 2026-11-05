@@ -45,24 +45,36 @@ export function validateEnrollmentPayload({ imageBase64, consentGiven = true }) 
   return { valid: true };
 }
 
-export function canEnrollFace({ requesterRole, isSelf, isAuthorizedByAdmin }) {
+export function canEnrollFace({
+  requesterRole,
+  isSelf,
+  isAuthorizedByAdmin,
+  isAlreadyEnrolled = false,
+  isReenrollmentAuthorized = false
+}) {
   const role = String(requesterRole || "").toLowerCase();
   const isAdmin = role === "admin" || role === "superadmin" || role === "hr manager";
 
   // Admins can enroll or re-enroll any user directly
   if (isAdmin) {
-    return { allowed: true };
+    return { allowed: true, mode: isAlreadyEnrolled ? "replacement" : "new" };
   }
 
   // Self-enrollment requires being the employee AND being authorized
   if (isSelf) {
-    if (isAuthorizedByAdmin) {
-      return { allowed: true };
+    if (!isAuthorizedByAdmin) {
+      return {
+        allowed: false,
+        error: "Face self-enrollment has not been authorized by HR or an Administrator."
+      };
     }
-    return {
-      allowed: false,
-      error: "Face self-enrollment has not been authorized by HR or an Administrator."
-    };
+    if (isAlreadyEnrolled && !isReenrollmentAuthorized) {
+      return {
+        allowed: false,
+        error: "Face template is already enrolled. Self-replacement is not permitted. Please contact your administrator."
+      };
+    }
+    return { allowed: true, mode: isAlreadyEnrolled ? "replacement" : "new" };
   }
 
   return {

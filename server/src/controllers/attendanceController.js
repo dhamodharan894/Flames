@@ -12,1056 +12,311 @@ import { generateVerificationSessionToken, hashToken } from "../services/livenes
 import { validateServerGeofence } from "../utils/geofence.js";
 import { withTransaction } from "../utils/transaction.js";
 
-export const getAttendance = async (req, res) => {
-  try {
-    const { userId, companyId, startDate, endDate, date } = req.query;
-    const isSuperAdmin = req.user?.role?.toLowerCase() === "superadmin";
-    const targetCompanyId = (isSuperAdmin && companyId) ? companyId : req.user?.companyId;
+const FACE_REENROLL_VALIDITY_HOURS = Number(process.env.FACE_REENROLL_VALIDITY_HOURS || 24);
 
-    let sql = `
-      SELECT a.*, a.date::text as date_str, a.id as "_id", u.name as user_name, u.name as "userName",
-             u.email as user_email, u.department as "userDept", u.department
-      FROM attendance a
-      LEFT JOIN users u ON a.user_id = u.id
-      WHERE 1=1
-    `;
-    const params = [];
-
-    if (req.user && req.user.role === "employee") {
-      params.push(req.user.id);
-      sql += ` AND a.user_id = $${params.length}`;
-    } else if (userId) {
-      params.push(userId);
-      sql += ` AND a.user_id = $${params.length}`;
-    }
-
-    if (targetCompanyId) {
-      params.push(targetCompanyId);
-      sql += ` AND a.company_id = $${params.length}`;
-    }
-
-    if (date) {
-      params.push(date);
-      sql += ` AND a.date = $${params.length}`;
-    }
-
-    if (startDate && endDate) {
-      params.push(startDate);
-      sql += ` AND a.date >= $${params.length}`;
-      params.push(endDate);
-      sql += ` AND a.date <= $${params.length}`;
-    }
-
-    sql += " ORDER BY a.date DESC, a.check_in DESC LIMIT 1000";
-    const result = await query(sql, params);
-
-    
-    // Format check_in/check_out/status for client
-    const logs = result.rows.map(row => {
-      const checkInDate = row.check_in ? new Date(row.check_in) : null;
-      const checkOutDate = row.check_out ? new Date(row.check_out) : null;
-      const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
-      
-      let totalBreakMinutes = 0;
-      if (Array.isArray(row.breaks)) {
-        row.breaks.forEach(b => {
-          if (b.start && b.end) {
-            totalBreakMinutes += Math.max(0, Math.floor((new Date(b.end) - new Date(b.start)) / 60000));
-          }
-        });
-      }
-
-      let workingMinutes = Number(row.duration_minutes) || 0;
-      if (!workingMinutes && checkInDate) {
-        const endTime = checkOutDate || new Date();
-        const rawMins = Math.max(0, Math.floor((endTime - checkInDate) / 60000));
-        if (rawMins > 0 && rawMins < 24 * 60) {
-          workingMinutes = Math.max(0, rawMins - totalBreakMinutes);
-        }
-      }
-
-      const durationHours = workingMinutes > 0 ? (workingMinutes / 60).toFixed(1) : (row.check_out ? "0.0" : "Live");
-      const dateStr = row.date_str || (row.date instanceof Date ? row.date.toISOString().split("T")[0] : (row.date ? String(row.date).split("T")[0] : ""));
-
-      let frontendStatus = "not-checked-in";
-      let currentBreakTimerEnd = null;
-      if (row.check_out) {
-        frontendStatus = "checked-out";
-      } else if (Array.isArray(row.breaks) && row.breaks.some(b => !b.end && !b.resumeTime)) {
-        frontendStatus = "on-break";
-        const activeB = row.breaks.find(b => !b.end && !b.resumeTime);
-        if (activeB) {
-          const bStart = new Date(activeB.start || activeB.startTime).getTime();
-          const bType = activeB.breakType || activeB.type || "short";
-          const durSec = bType === "bio" ? 900 : 1800;
-          currentBreakTimerEnd = new Date(bStart + durSec * 1000).toISOString();
-        }
-      } else if (row.check_in) {
-        frontendStatus = "checked-in";
-      }
-
-      return {
-        ...row,
-        id: row.id,
-        userId: row.user_id,
-        companyId: row.company_id,
-        date: dateStr,
-        checkIn: formatTime(checkInDate),
-        checkOut: formatTime(checkOutDate),
-        checkInTime: row.check_in,
-        checkOutTime: row.check_out,
-        checkInLocation: row.check_in_location || row.location,
-        checkOutLocation: row.check_out_location,
-        duration_minutes: workingMinutes,
-        durationMinutes: workingMinutes,
-        totalWorkingMinutes: workingMinutes,
-        workingDuration: workingMinutes,
-        totalHours: durationHours,
-        status: frontendStatus,
-        currentBreakTimerEnd
-      };
-    });
-
-    res.json(logs);
-  } catch (err) {
-    console.error("getAttendance error:", err);
-    res.status(500).json({ error: "Failed to fetch attendance logs." });
-  }
+const isAdminRole = (user) => {
+  const role = String(user?.role || "").toLowerCase();
+  return ["admin", "superadmin", "system admin", "hr manager"].includes(role);
 };
 
-export const checkIn = async (req, res) => {
-  try {
-    let userId = req.user?.id || req.body.userId;
-    if (typeof userId === "object" && userId !== null) {
-      userId = userId.uid || userId.id;
-    }
-    const companyId = req.user?.companyId || req.body.companyId || req.body.userId?.companyId;
-    const today = req.body.date || new Date().toISOString().split("T")[0];
-    const now = new Date().toISOString();
-    const { location, workMode = "office", verificationSessionToken } = req.body;
-
-    if (!verificationSessionToken) {
-      return res.status(400).json({
-        error: "Biometric verification is required. Please capture a selfie to check in."
-      });
-    }
-
-    // Server-side geofence validation before database transaction
-    const geoCheck = await validateServerGeofence({ companyId, location, user: req.user });
-    if (!geoCheck.allowed) {
-      return res.status(400).json({
-        error: geoCheck.reason || "Check-in denied: You are outside the permitted workplace area."
-      });
-    }
-
-    const tokenHash = hashToken(verificationSessionToken);
-    const recordId = `${userId}_${today}`;
-
-    // Execute session consumption and attendance mutation atomically using withTransaction
-    const txResult = await withTransaction(async (client) => {
-      // 1. Atomically consume the verification session token for this user, company, action, and unexpired validity
-      const sessionRes = await client.query(
-        `UPDATE attendance_verification_sessions
-         SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE token_hash = $1
-           AND user_id = $2
-           AND company_id = $3
-           AND status = 'issued'
-           AND expires_at > CURRENT_TIMESTAMP
-           AND (action_type IS NULL OR action_type = 'check-in')
-         RETURNING *`,
-        [tokenHash, userId, companyId]
-      );
-
-      if (sessionRes.rows.length === 0) {
-        const err = new Error("Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie.");
-        err.statusCode = 403;
-        err.isSessionReplay = true;
-        throw err;
-      }
-
-      // 2. Perform attendance database mutation using the exact same PostgreSQL client
-      const result = await client.query(
-        `INSERT INTO attendance (id, user_id, company_id, date, check_in, status, work_mode, check_in_location, location)
-         VALUES ($1, $2, $3, $4, $5, 'present', $6, $7, $7)
-         ON CONFLICT (id) DO UPDATE SET
-           check_in = COALESCE(attendance.check_in, EXCLUDED.check_in),
-           check_out = NULL,
-           status = 'present',
-           check_in_location = EXCLUDED.check_in_location,
-           updated_at = CURRENT_TIMESTAMP
-         RETURNING *`,
-        [recordId, userId, companyId, today, now, workMode, JSON.stringify(location || {})]
-      );
-
-      return {
-        session: sessionRes.rows[0],
-        attendance: result.rows[0]
-      };
-    });
-
-    const row = txResult.attendance;
-    const checkInDate = row.check_in ? new Date(row.check_in) : new Date();
-    const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
-
-    // Audit logging executes outside the transaction, preserving asynchronous non-blocking behavior
-    auditService.logAudit({
-      userId,
-      action: "ATTENDANCE_CLOCK_IN",
-      resourceType: "attendance",
-      resourceId: row.id,
-      details: { date: today, workMode, location, verificationSessionId: txResult.session.id },
-      req
-    });
-
-    return res.json({
-      ...row,
-      id: row.id,
-      userId: row.user_id,
-      companyId: row.company_id,
-      date: today,
-      checkIn: formatTime(checkInDate),
-      checkInTime: row.check_in || now,
-      checkInLocation: row.check_in_location || row.location,
-      status: "checked-in"
-    });
-  } catch (err) {
-    if (err.isSessionReplay || err.statusCode === 403) {
-      let userId = req.user?.id || req.body.userId;
-      if (typeof userId === "object" && userId !== null) userId = userId.uid || userId.id;
-      const tokenHash = req.body?.verificationSessionToken ? hashToken(req.body.verificationSessionToken) : "unknown";
-
-      auditService.logAudit({
-        userId,
-        action: "ATTENDANCE_VERIFICATION_REPLAY_REJECTED",
-        resourceType: "attendance",
-        resourceId: `session_${tokenHash.slice(0, 10)}`,
-        details: { reason: "Invalid, expired, or already-consumed verification token", action: "check-in" },
-        req
-      });
-
-      return res.status(403).json({
-        error: "Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie."
-      });
-    }
-
-    console.error("checkIn error:", err);
-    return res.status(500).json({ error: "Check-in failed." });
-  }
+const getActiveFaceReenrollmentPermission = async (employeeId, companyId) => {
+  await ensureFaceReenrollmentTable();
+  const result = await query(
+    `SELECT *
+     FROM face_reenrollment_requests
+     WHERE employee_id = $1
+       AND company_id = $2
+       AND status = 'approved'
+       AND permission_expires_at IS NOT NULL
+       AND permission_expires_at > NOW()
+       AND used_at IS NULL
+     ORDER BY requested_at DESC
+     LIMIT 1`,
+    [employeeId, companyId]
+  );
+  return result.rows[0] || null;
 };
 
-export const checkOut = async (req, res) => {
-  try {
-    let userId = req.user?.id || req.body.userId;
-    if (typeof userId === "object" && userId !== null) {
-      userId = userId.uid || userId.id;
-    }
-    const companyId = req.user?.companyId || req.body.companyId;
-    const today = req.body.date || new Date().toISOString().split("T")[0];
-    const now = new Date().toISOString();
-    const { location, verificationSessionToken } = req.body;
-
-    if (!verificationSessionToken) {
-      return res.status(400).json({
-        error: "Biometric verification is required. Please capture a selfie to check out."
-      });
-    }
-
-    const tokenHash = hashToken(verificationSessionToken);
-    const recordId = `${userId}_${today}`;
-
-    // Execute prerequisite check, session consumption, and attendance update atomically inside withTransaction
-    const txResult = await withTransaction(async (client) => {
-      // 1. Prerequisite check: confirm that a valid check-in exists before checking out
-      const existing = await client.query("SELECT * FROM attendance WHERE id = $1 FOR UPDATE", [recordId]);
-      if (existing.rows.length === 0 || !existing.rows[0].check_in) {
-        const err = new Error("No check-in found for today.");
-        err.statusCode = 404;
-        throw err;
-      }
-
-      // 2. Atomically consume the verification session token for this user, company, action, and unexpired validity
-      const sessionRes = await client.query(
-        `UPDATE attendance_verification_sessions
-         SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE token_hash = $1
-           AND user_id = $2
-           AND company_id = $3
-           AND status = 'issued'
-           AND expires_at > CURRENT_TIMESTAMP
-           AND (action_type IS NULL OR action_type = 'check-out')
-         RETURNING *`,
-        [tokenHash, userId, companyId]
-      );
-
-      if (sessionRes.rows.length === 0) {
-        const err = new Error("Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie.");
-        err.statusCode = 403;
-        err.isSessionReplay = true;
-        throw err;
-      }
-
-      const rowData = existing.rows[0];
-      let durationMinutes = 0;
-      const breaks = Array.isArray(rowData.breaks) ? [...rowData.breaks] : [];
-      let totalBreakMinutes = 0;
-
-      breaks.forEach(b => {
-        if (b.start && b.end) {
-          totalBreakMinutes += Math.max(0, Math.floor((new Date(b.end) - new Date(b.start)) / 60000));
-        } else if (b.start && !b.end) {
-          b.end = now;
-          const dur = Math.max(0, Math.floor((new Date(now) - new Date(b.start)) / 60000));
-          b.durationMinutes = dur;
-          totalBreakMinutes += dur;
-        }
-      });
-
-      if (rowData.check_in) {
-        const checkInTime = new Date(rowData.check_in);
-        const rawElapsed = Math.max(0, Math.floor((new Date(now) - checkInTime) / 60000));
-        durationMinutes = Math.max(0, rawElapsed - totalBreakMinutes);
-      }
-
-      const isAbsentPenalized = Boolean(rowData.is_admin_locked || rowData.status === "absent" || rowData.penalty_status);
-      const checkoutStatus = isAbsentPenalized ? "absent" : (durationMinutes < 240 ? "half-day" : "present");
-
-      const result = await client.query(
-        `UPDATE attendance
-         SET check_out = $1, check_out_location = $2, duration_minutes = $3, breaks = $4, status = $5, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $6
-         RETURNING *`,
-        [now, JSON.stringify(location || {}), durationMinutes, JSON.stringify(breaks), checkoutStatus, recordId]
-      );
-
-      return {
-        session: sessionRes.rows[0],
-        attendance: result.rows[0],
-        durationMinutes
-      };
-    });
-
-    const row = txResult.attendance;
-    const checkOutDate = row.check_out ? new Date(row.check_out) : new Date();
-    const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
-
-    // Audit logging executes outside the transaction, preserving asynchronous non-blocking behavior
-    auditService.logAudit({
-      userId: row.user_id,
-      action: "ATTENDANCE_CLOCK_OUT",
-      resourceType: "attendance",
-      resourceId: row.id,
-      details: { date: today, totalWorkingMinutes: txResult.durationMinutes, verificationSessionId: txResult.session.id },
-      req
-    });
-
-    return res.json({
-      ...row,
-      id: row.id,
-      userId: row.user_id,
-      companyId: row.company_id,
-      date: today,
-      checkOut: formatTime(checkOutDate),
-      checkOutTime: row.check_out || now,
-      totalWorkingMinutes: txResult.durationMinutes,
-      workingDuration: txResult.durationMinutes,
-      status: "checked-out"
-    });
-  } catch (err) {
-    if (err.statusCode === 404) {
-      return res.status(404).json({ error: err.message || "No check-in found for today." });
-    }
-
-    if (err.isSessionReplay || err.statusCode === 403) {
-      let userId = req.user?.id || req.body.userId;
-      if (typeof userId === "object" && userId !== null) userId = userId.uid || userId.id;
-      const tokenHash = req.body?.verificationSessionToken ? hashToken(req.body.verificationSessionToken) : "unknown";
-
-      auditService.logAudit({
-        userId,
-        action: "ATTENDANCE_VERIFICATION_REPLAY_REJECTED",
-        resourceType: "attendance",
-        resourceId: `session_${tokenHash.slice(0, 10)}`,
-        details: { reason: "Invalid, expired, or already-consumed verification token", action: "check-out" },
-        req
-      });
-
-      return res.status(403).json({
-        error: "Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie."
-      });
-    }
-
-    console.error("checkOut error:", err);
-    return res.status(500).json({ error: "Check-out failed." });
-  }
+export const getFaceReenrollmentPermission = async (employeeId, companyId) => {
+  if (!employeeId || !companyId) return null;
+  return getActiveFaceReenrollmentPermission(employeeId, companyId);
 };
 
+export const validateFaceReenrollmentPermission = async (employeeId, companyId) => {
+  if (!employeeId || !companyId) return null;
+  return getActiveFaceReenrollmentPermission(employeeId, companyId);
+};
 
-export const startBreak = async (req, res) => {
+export const requestFaceReenrollment = async (req, res) => {
   try {
-    let userId = req.user?.id || req.body.userId;
-    if (typeof userId === "object" && userId !== null) {
-      userId = userId.uid || userId.id;
-    }
-    const today = req.body.date || new Date().toISOString().split("T")[0];
-    const now = new Date().toISOString();
-    const { breakType = "short", reason = "break", location } = req.body;
-
-    const recordId = `${userId}_${today}`;
-    const existing = await query("SELECT * FROM attendance WHERE id = $1", [recordId]);
-    if (existing.rows.length === 0 || !existing.rows[0].check_in) {
-      return res.status(400).json({ error: "Cannot start a break without checking in first." });
-    }
-    if (existing.rows[0].check_out) {
-      return res.status(400).json({ error: "Cannot start a break after checking out." });
+    await ensureFaceReenrollmentTable();
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      return res.status(400).json({ error: "A brief reason is required before requesting face re-enrollment." });
     }
 
-    const row = existing.rows[0];
-    const breaks = Array.isArray(row.breaks) ? [...row.breaks] : [];
-    if (breaks.some(b => !b.end && !b.resumeTime)) {
-      return res.status(400).json({ error: "A break is already in progress." });
+    const userId = req.user?.id;
+    const companyId = req.user?.companyId;
+
+    if (!userId || !companyId) {
+      return res.status(401).json({ error: "Authenticated session required." });
     }
 
-    // Daily 3-break limit check
-    if (breaks.length >= 3) {
-      return res.status(400).json({ error: "Maximum limit reached. An employee can only take up to 3 breaks per day." });
-    }
-
-    // Check if this specific break has already been taken and resumed
-    const normalizedReqType = String(breakType).toLowerCase();
-    const isTypeAlreadyUsed = breaks.some(b => {
-      const bType = String(b.breakType || b.type || "").toLowerCase();
-      const isResumed = Boolean(b.end || b.resumeTime);
-      if (!isResumed) return false;
-
-      if (normalizedReqType === "short" || normalizedReqType === "break1") {
-        return bType === "short" || bType === "break1";
-      }
-      if (normalizedReqType === "long" || normalizedReqType === "break2") {
-        return bType === "long" || bType === "break2";
-      }
-      if (normalizedReqType === "bio" || normalizedReqType === "break3") {
-        return bType === "bio" || bType === "break3";
-      }
-      return bType === normalizedReqType;
-    });
-
-    if (isTypeAlreadyUsed) {
-      return res.status(400).json({ error: "This break has already been taken and resumed today. It has been removed from your available breaks." });
-    }
-
-    let durationSeconds = 1800; // default 30 mins
-    if (normalizedReqType === "bio" || normalizedReqType === "break3") durationSeconds = 900; // 15 mins
-    const timerEnd = new Date(Date.now() + durationSeconds * 1000).toISOString();
-
-    breaks.push({
-      start: now,
-      startTime: now,
-      end: null,
-      resumeTime: null,
-      breakType,
-      type: breakType,
-      reason,
-      location: location || null
-    });
-
-    const result = await query(
-      `UPDATE attendance
-       SET breaks = $1, status = 'on-break', updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING *`,
-      [JSON.stringify(breaks), recordId]
+    const existingProfile = await query(
+      `SELECT * FROM employee_face_profiles WHERE user_id = $1 AND company_id = $2`,
+      [userId, companyId]
     );
 
-    const updated = result.rows[0];
-
-    // Non-blocking Audit Log: Break Started
-    auditService.logAudit({
-      userId,
-      action: "ATTENDANCE_BREAK_START",
-      resourceType: "attendance",
-      resourceId: recordId,
-      details: {
-        breakNumber: breaks.length,
-        breakType,
-        startTime: now,
-        durationMinutes: durationSeconds / 60,
-        remainingBreaksAfterThis: Math.max(0, 3 - breaks.length),
-        location: location || null
-      },
-      req
-    });
-
-    res.json({
-      ...updated,
-      id: updated.id,
-      userId: updated.user_id,
-      companyId: updated.company_id,
-      date: today,
-      checkInTime: updated.check_in,
-      checkOutTime: updated.check_out,
-      currentBreakTimerEnd: timerEnd,
-      status: "on-break",
-      breaks: updated.breaks
-    });
-  } catch (err) {
-    console.error("startBreak error:", err);
-    res.status(500).json({ error: "Failed to start break." });
-  }
-};
-
-export const endBreak = async (req, res) => {
-  try {
-    let userId = req.user?.id || req.body.userId;
-    if (typeof userId === "object" && userId !== null) {
-      userId = userId.uid || userId.id;
-    }
-    const today = req.body.date || new Date().toISOString().split("T")[0];
-    const now = new Date().toISOString();
-    const { location } = req.body;
-
-    const recordId = `${userId}_${today}`;
-    const existing = await query("SELECT * FROM attendance WHERE id = $1", [recordId]);
-    if (existing.rows.length === 0 || !existing.rows[0].check_in) {
-      return res.status(400).json({ error: "No attendance record found for today." });
+    if (existingProfile.rows.length === 0 || existingProfile.rows[0].enrollment_status !== "enrolled") {
+      return res.status(400).json({ error: "Face re-enrollment can only be requested after a face has already been enrolled." });
     }
 
-    const row = existing.rows[0];
-    const breaks = Array.isArray(row.breaks) ? [...row.breaks] : [];
-    const activeIdx = breaks.findIndex(b => !b.end && !b.resumeTime);
-    if (activeIdx === -1) {
-      return res.status(400).json({ error: "No active break to resume from." });
-    }
-
-    const breakStart = new Date(breaks[activeIdx].start || breaks[activeIdx].startTime);
-    const breakDurationMinutes = Math.max(0, Math.floor((new Date(now) - breakStart) / 60000));
-    breaks[activeIdx].end = now;
-    breaks[activeIdx].resumeTime = now;
-    breaks[activeIdx].durationMinutes = breakDurationMinutes;
-    breaks[activeIdx].duration = breakDurationMinutes;
-    if (location) breaks[activeIdx].endLocation = location;
-
-    const result = await query(
-      `UPDATE attendance
-       SET breaks = $1, status = 'present', updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING *`,
-      [JSON.stringify(breaks), recordId]
+    const pendingCheck = await query(
+      `SELECT *
+       FROM face_reenrollment_requests
+       WHERE employee_id = $1
+         AND company_id = $2
+         AND status = 'pending'
+       ORDER BY requested_at DESC
+       LIMIT 1`,
+      [userId, companyId]
     );
 
-    const updated = result.rows[0];
-
-    // Non-blocking Audit Log: Break Resumed
-    const completedBreak = breaks[activeIdx];
-    const totalCompletedBreaks = breaks.filter(b => b.end || b.resumeTime).length;
-    auditService.logAudit({
-      userId: row.user_id,
-      action: "ATTENDANCE_BREAK_RESUME",
-      resourceType: "attendance",
-      resourceId: recordId,
-      details: {
-        breakNumber: activeIdx + 1,
-        breakType: completedBreak.breakType || completedBreak.type,
-        startTime: completedBreak.start || completedBreak.startTime,
-        resumeTime: now,
-        durationMinutes: breakDurationMinutes,
-        totalCompletedBreaks,
-        remainingBreaks: Math.max(0, 3 - totalCompletedBreaks),
-        location: location || null
-      },
-      req
-    });
-
-    res.json({
-      ...updated,
-      id: updated.id,
-      userId: updated.user_id,
-      companyId: updated.company_id,
-      date: today,
-      checkInTime: updated.check_in,
-      checkOutTime: updated.check_out,
-      status: "checked-in",
-      breaks: updated.breaks
-    });
-  } catch (err) {
-    console.error("endBreak error:", err);
-    res.status(500).json({ error: "Failed to end break." });
-  }
-};
-
-export const updateAttendance = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const callerRole = req.user?.role?.toLowerCase();
-    const isAllowed = callerRole === "admin" || callerRole === "superadmin" || callerRole === "manager" || callerRole === "system admin";
-
-    if (!isAllowed) {
-      return res.status(403).json({ error: "Access forbidden. Admin or Manager role required to edit attendance records." });
+    if (pendingCheck.rows.length > 0) {
+      return res.status(409).json({
+        error: "A face re-enrollment request is already pending approval.",
+        request: pendingCheck.rows[0]
+      });
     }
 
-    const { checkIn, checkOut, status, date } = req.body;
-
-    let existing = await query("SELECT * FROM attendance WHERE id = $1", [id]);
-    if (existing.rows.length === 0) {
-      existing = await query(
-        "SELECT * FROM attendance WHERE user_id = $1 AND (date >= CURRENT_DATE - INTERVAL '1 day') ORDER BY date DESC, updated_at DESC LIMIT 1",
-        [id]
-      );
+    const activeApproved = await getActiveFaceReenrollmentPermission(userId, companyId);
+    if (activeApproved) {
+      return res.status(409).json({
+        error: "You already have an active approved face re-enrollment permission.",
+        request: activeApproved
+      });
     }
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: "Attendance record not found." });
-    }
-    const targetAttId = existing.rows[0].id;
-    const targetUserId = existing.rows[0].user_id;
 
+    const requestId = `face_reenroll_${crypto.randomUUID()}`;
     const result = await query(
-      `UPDATE attendance
-       SET check_in = COALESCE($1, check_in),
-           check_out = COALESCE($2, check_out),
-           status = COALESCE($3, status),
-           date = COALESCE($4, date),
-           is_admin_locked = CASE WHEN $3 = 'present' THEN FALSE ELSE is_admin_locked END,
-           penalty_status = CASE WHEN $3 = 'present' THEN NULL ELSE penalty_status END,
-           penalty_reason = CASE WHEN $3 = 'present' THEN NULL ELSE penalty_reason END,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5
+      `INSERT INTO face_reenrollment_requests (id, employee_id, company_id, reason, status, requested_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'pending', NOW(), NOW(), NOW())
        RETURNING *`,
-      [checkIn || null, checkOut || null, status || null, date || null, targetAttId]
+      [requestId, userId, companyId, reason]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Attendance record not found." });
-    }
-
-    if (status === 'present') {
-      await query(
-        "UPDATE tasks SET sla_penalty_applied = FALSE, updated_at = NOW() WHERE assigned_to = $1 AND sla_penalty_applied = TRUE",
-        [targetUserId]
-      ).catch(() => {});
-    }
-
-    const updatedRow = result.rows[0];
-    auditService.logAudit({
-      userId: req.user?.id,
-      action: "ATTENDANCE_EDIT",
-      resourceType: "attendance",
-      resourceId: id,
-      details: { checkIn, checkOut, status, date, targetUserId: updatedRow.user_id },
-      req
-    });
-    securityDetector.checkSuspiciousAction({
-      userId: req.user?.id,
-      action: "ATTENDANCE_EDIT",
-      resourceType: "attendance",
-      details: { checkIn, checkOut, status, date, targetUserId: updatedRow.user_id },
-      req
-    });
-
-    res.json(updatedRow);
-  } catch (err) {
-    console.error("updateAttendance error:", err);
-    res.status(500).json({ error: "Failed to update attendance." });
-  }
-};
-
-export const deleteAttendance = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const callerRole = req.user?.role?.toLowerCase();
-    const isAllowed = callerRole === "admin" || callerRole === "superadmin" || callerRole === "system admin";
-
-    if (!isAllowed) {
-      return res.status(403).json({ error: "Access forbidden. Admin role required to delete attendance records." });
-    }
-
-    const result = await query("DELETE FROM attendance WHERE id = $1 RETURNING id", [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Attendance record not found." });
-    }
-    res.json({ message: "Attendance record deleted.", id });
-  } catch (err) {
-    console.error("deleteAttendance error:", err);
-    res.status(500).json({ error: "Failed to delete attendance record." });
-  }
-
-};
-
-// Rules
-export const getAttendanceRules = async (req, res) => {
-  try {
-    const { companyId } = req.query;
-    const targetCompanyId = companyId || req.user?.companyId;
-
-    if (targetCompanyId) {
-      const compResult = await query("SELECT value FROM settings WHERE key = $1", [`attendance_rules_${targetCompanyId}`]);
-      if (compResult.rows.length > 0) {
-        const val = compResult.rows[0].value;
-        return res.json({ rules: typeof val === "object" && val !== null ? (val.rules || "") : (val || "") });
-      }
-    }
-
-    const result = await query("SELECT value FROM settings WHERE key = 'attendance_rules'");
-    if (result.rows.length > 0) {
-      const val = result.rows[0].value;
-      res.json({ rules: typeof val === "object" && val !== null ? (val.rules || "") : (val || "") });
-    } else {
-      res.json({ rules: "" });
-    }
-  } catch (err) {
-    console.error("getAttendanceRules error:", err);
-    res.status(500).json({ error: "Failed to fetch attendance rules." });
-  }
-};
-
-export const updateAttendanceRules = async (req, res) => {
-  try {
-    const { rules, companyId } = req.body;
-    const targetCompanyId = companyId || req.user?.companyId;
-
-    if (targetCompanyId) {
-      await query(
-        `INSERT INTO settings (key, value)
-         VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
-        [`attendance_rules_${targetCompanyId}`, JSON.stringify({ rules })]
-      );
-    }
 
     await query(
-      `INSERT INTO settings (key, value)
-       VALUES ('attendance_rules', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
-      [JSON.stringify({ rules })]
+      `UPDATE employee_face_profiles
+       SET reenrollment_requested_at = NOW(),
+           reenrollment_reason = $2,
+           metadata = COALESCE(metadata, '{}'::jsonb) || '{"reenrollmentRequested": true}'::jsonb,
+           updated_at = NOW()
+       WHERE user_id = $1 AND company_id = $3`,
+      [userId, reason, companyId]
     );
 
-    res.json({ success: true, rules });
-  } catch (err) {
-    console.error("updateAttendanceRules error:", err);
-    res.status(500).json({ error: "Failed to update attendance rules." });
-  }
-};
-
-// ============================================================================
-// BIOMETRIC FACE ENROLLMENT & MANAGEMENT
-// ============================================================================
-
-export const getFaceStatus = async (req, res) => {
-  try {
-    const targetUserId = req.query.userId || req.user.id;
-    const role = (req.user?.role || "").toLowerCase();
-    const isSuperAdmin = role === "superadmin";
-    const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
-
-    // Non-admins can only query their own status
-    if (targetUserId !== req.user.id && !isAdmin && !isSuperAdmin) {
-      return res.status(403).json({ error: "Access denied. Cannot view biometrics for other employees." });
-    }
-
-    const companyId = req.user.companyId;
-    let sql = "SELECT * FROM employee_face_profiles WHERE user_id = $1";
-    const params = [targetUserId];
-
-    if (!isSuperAdmin && companyId) {
-      sql += " AND company_id = $2";
-      params.push(companyId);
-    }
-
-    const result = await query(sql, params);
-    if (result.rows.length === 0) {
-      return res.json({
-        user_id: targetUserId,
-        enrollment_status: "pending",
-        is_enrolled: false,
-        metadata: {}
-      });
-    }
-
-    const row = result.rows[0];
-    res.json({
-      id: row.id,
-      user_id: row.user_id,
-      company_id: row.company_id,
-      enrollment_status: row.enrollment_status,
-      is_enrolled: row.enrollment_status === "enrolled",
-      embedding_model: row.embedding_model,
-      enrolled_at: row.enrolled_at,
-      consent_recorded_at: row.consent_recorded_at,
-      metadata: row.metadata || {}
+    auditService.logAudit({
+      userId,
+      action: "FACE_REENROLLMENT_REQUESTED",
+      resourceType: "biometrics",
+      resourceId: requestId,
+      details: { reason, companyId },
+      req
     });
+
+    res.json({ success: true, request: result.rows[0] });
   } catch (err) {
-    console.error("getFaceStatus error:", err);
-    res.status(500).json({ error: "Failed to fetch biometric enrollment status." });
+    console.error("requestFaceReenrollment error:", err);
+    res.status(500).json({ error: "Failed to submit face re-enrollment request." });
   }
 };
 
-export const authorizeFaceEnrollment = async (req, res) => {
+export const getMyFaceReenrollmentRequest = async (req, res) => {
   try {
-    const { targetUserId } = req.body;
-    if (!targetUserId) {
-      return res.status(400).json({ error: "targetUserId is required." });
+    const userId = req.user?.id;
+    const companyId = req.user?.companyId;
+
+    if (!userId || !companyId) {
+      return res.status(401).json({ error: "Authenticated session required." });
     }
 
+    const result = await query(
+      `SELECT *
+       FROM face_reenrollment_requests
+       WHERE employee_id = $1 AND company_id = $2
+       ORDER BY requested_at DESC
+       LIMIT 1`,
+      [userId, companyId]
+    );
+
+    res.json({ request: result.rows[0] || null });
+  } catch (err) {
+    console.error("getMyFaceReenrollmentRequest error:", err);
+    res.status(500).json({ error: "Failed to load your face re-enrollment request." });
+  }
+};
+
+export const getFaceReenrollmentRequests = async (req, res) => {
+  try {
     const role = (req.user?.role || "").toLowerCase();
     const isSuperAdmin = role === "superadmin";
     const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
 
     if (!isAdmin && !isSuperAdmin) {
-      return res.status(403).json({ error: "Only administrators and HR personnel can authorize face enrollment." });
+      return res.status(403).json({ error: "Access denied. Admin role required." });
     }
 
+    const status = String(req.query.status || "pending").trim().toLowerCase();
     const companyId = req.user.companyId;
 
-    // Validate target user exists and belongs to tenant
-    const userCheck = await query("SELECT id, name, email, company_id FROM users WHERE id = $1", [targetUserId]);
-    if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: "Target employee not found." });
+    let sql = `
+      SELECT r.*, u.name as employee_name, u.email as employee_email
+      FROM face_reenrollment_requests r
+      LEFT JOIN users u ON u.id = r.employee_id
+      WHERE 1 = 1
+    `;
+    const params = [];
+
+    if (!isSuperAdmin && companyId) {
+      params.push(companyId);
+      sql += ` AND r.company_id = $${params.length}`;
     }
 
-    const targetUser = userCheck.rows[0];
-    if (!isSuperAdmin && targetUser.company_id !== companyId) {
-      return res.status(403).json({ error: "Access denied. Target employee belongs to another organization." });
+    if (status && status !== "all") {
+      params.push(status);
+      sql += ` AND r.status = $${params.length}`;
     }
 
-    const profileId = `${targetUserId}_profile`;
-    const now = new Date().toISOString();
+    sql += ` ORDER BY r.requested_at DESC`;
 
-    await query(
-      `INSERT INTO employee_face_profiles (id, user_id, company_id, enrollment_status, metadata, updated_at)
-       VALUES ($1, $2, $3, 'pending', $4, CURRENT_TIMESTAMP)
-       ON CONFLICT (id) DO UPDATE SET
-         metadata = COALESCE(employee_face_profiles.metadata, '{}'::jsonb) || $4,
-         updated_at = CURRENT_TIMESTAMP`,
-      [
-        profileId,
-        targetUserId,
-        targetUser.company_id || companyId,
-        JSON.stringify({
-          selfEnrollmentAuthorized: true,
-          authorizedAt: now,
-          authorizedBy: req.user.id
-        })
-      ]
-    );
-
-    auditService.logAudit({
-      userId: req.user.id,
-      action: "BIOMETRIC_ENROLLMENT_AUTHORIZED",
-      resourceType: "biometrics",
-      resourceId: profileId,
-      details: { targetUserId, authorizedBy: req.user.id },
-      req
-    });
-
-    res.json({
-      success: true,
-      message: "Face self-enrollment authorized successfully for employee.",
-      targetUserId
-    });
+    const result = await query(sql, params);
+    res.json(result.rows);
   } catch (err) {
-    console.error("authorizeFaceEnrollment error:", err);
-    res.status(500).json({ error: "Failed to authorize face enrollment." });
+    console.error("getFaceReenrollmentRequests error:", err);
+    res.status(500).json({ error: "Failed to load face re-enrollment requests." });
   }
 };
 
-export const enrollFace = async (req, res) => {
+export const approveFaceReenrollmentRequest = async (req, res) => {
   try {
-    const { imageBase64, consentGiven, biometricConsent, targetUserId, userId } = req.body;
-    const consent = consentGiven !== undefined ? consentGiven : (biometricConsent !== undefined ? biometricConsent : true);
-    const resolvedTargetId = targetUserId || userId || req.user.id;
-    const isSelf = resolvedTargetId === req.user.id;
+    const { id } = req.params;
     const role = (req.user?.role || "").toLowerCase();
     const isSuperAdmin = role === "superadmin";
-    const isAdmin = role === "admin" || isSuperAdmin || role === "hr manager";
+    const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
 
-    // Check enrollment permission: only admin or self-enroller
-    if (!isSelf && !isAdmin) {
-      return res.status(403).json({ error: "Unauthorized: Cannot enroll face biometrics for another user." });
+    if (!isAdmin && !isSuperAdmin) {
+      return res.status(403).json({ error: "Access denied. Admin role required." });
     }
 
-    let targetCompanyId = req.user.companyId;
-
-    // Admin enrolling employee: validate target employee identity and company isolation
-    if (!isSelf) {
-      const userCheck = await query(
-        "SELECT id, name, email, company_id, status FROM users WHERE id = $1",
-        [resolvedTargetId]
-      );
-      if (userCheck.rows.length === 0) {
-        return res.status(404).json({ error: "Target employee not found." });
-      }
-      const targetUser = userCheck.rows[0];
-      if (!isSuperAdmin && targetUser.company_id !== req.user.companyId) {
-        return res.status(403).json({
-          error: "Access denied. Target employee belongs to another organization.",
-          code: "CROSS_TENANT_ACCESS_DENIED"
-        });
-      }
-      targetCompanyId = targetUser.company_id || req.user.companyId;
-    }
-
-    // If self-enrollment, confirm employee has been authorized and prevent unauthorized self-replacement
-    if (isSelf && !isAdmin) {
-      const profileCheck = await query(
-        "SELECT metadata, enrollment_status FROM employee_face_profiles WHERE user_id = $1 AND company_id = $2",
-        [req.user.id, targetCompanyId]
-      );
-      const profileRow = profileCheck.rows[0];
-      const isAuthorized = Boolean(profileRow?.metadata?.selfEnrollmentAuthorized);
-
-      if (!isAuthorized) {
-        return res.status(403).json({
-          error: "Face self-enrollment has not been authorized by HR or an Administrator.",
-          code: "SELF_ENROLLMENT_NOT_AUTHORIZED"
-        });
-      }
-
-      // Prevent replacing already-enrolled face unless explicitly re-authorized
-      if (profileRow?.enrollment_status === "enrolled" && !profileRow?.metadata?.reenrollmentAuthorized) {
-        return res.status(403).json({
-          error: "Face template is already enrolled. Self-replacement is not permitted. Please contact your administrator.",
-          code: "SELF_ENROLLMENT_NOT_AUTHORIZED"
-        });
-      }
-    }
-
-    // Biometric consent check
-    const validation = validateEnrollmentPayload({ imageBase64, consentGiven: consent });
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.error });
-    }
-
-    // Call Python microservice
-    let microserviceResult;
-    try {
-      microserviceResult = await faceServiceClient.enrollFace(imageBase64);
-    } catch (svcErr) {
-      auditService.logAudit({
-        userId: req.user.id,
-        action: "BIOMETRIC_ENROLLMENT_FAILED",
-        resourceType: "biometrics",
-        resourceId: resolvedTargetId,
-        details: { reason: svcErr.message, targetUserId: resolvedTargetId },
-        status: "FAILURE",
-        severity: "WARNING",
-        req
-      });
-      return res.status(svcErr.status || 400).json({ error: svcErr.message });
-    }
-
-    const { embedding, model, embedding_dimension, quality_score, face_count } = microserviceResult;
-
-    if (!isValidEmbedding(embedding, 512)) {
-      return res.status(500).json({ error: "Biometric service generated an invalid face embedding vector." });
-    }
-
-    const profileId = `${resolvedTargetId}_profile`;
-    const now = new Date().toISOString();
-
-    await query(
-      `INSERT INTO employee_face_profiles (
-         id, user_id, company_id, enrollment_status, face_embedding,
-         embedding_model, embedding_dimension, enrolled_by, enrolled_at,
-         consent_recorded_at, metadata, updated_at
-       ) VALUES ($1, $2, $3, 'enrolled', $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8, CURRENT_TIMESTAMP)
-       ON CONFLICT (id) DO UPDATE SET
-         enrollment_status = 'enrolled',
-         face_embedding = EXCLUDED.face_embedding,
-         embedding_model = EXCLUDED.embedding_model,
-         embedding_dimension = EXCLUDED.embedding_dimension,
-         enrolled_by = EXCLUDED.enrolled_by,
-         enrolled_at = CURRENT_TIMESTAMP,
-         consent_recorded_at = CURRENT_TIMESTAMP,
-         metadata = COALESCE(employee_face_profiles.metadata, '{}'::jsonb) || EXCLUDED.metadata,
-         updated_at = CURRENT_TIMESTAMP`,
-      [
-        profileId,
-        resolvedTargetId,
-        targetCompanyId,
-        JSON.stringify(embedding),
-        model || "ArcFace",
-        embedding_dimension || 512,
-        req.user.id,
-        JSON.stringify({
-          qualityScore: quality_score,
-          faceCount: face_count,
-          enrolledByRole: req.user.role,
-          consentRecorded: true,
-          enrolledBy: req.user.id
-        })
-      ]
+    const result = await query(
+      `UPDATE face_reenrollment_requests
+       SET status = 'approved',
+           reviewed_by = $1,
+           reviewed_at = NOW(),
+           rejection_reason = NULL,
+           permission_expires_at = NOW() + INTERVAL '${FACE_REENROLL_VALIDITY_HOURS} hours',
+           updated_at = NOW()
+       WHERE id = $2 ${!isSuperAdmin ? "AND company_id = $3" : ""}
+       RETURNING *`,
+      !isSuperAdmin ? [req.user.id, id, req.user.companyId] : [req.user.id, id]
     );
 
-    auditService.logAudit({
-      userId: req.user.id,
-      action: "BIOMETRIC_ENROLLMENT_SUCCESS",
-      resourceType: "biometrics",
-      resourceId: profileId,
-      details: { targetUserId: resolvedTargetId, enrolledBy: req.user.id, model: model || "ArcFace" },
-      req
-    });
-
-    res.json({
-      success: true,
-      enrollment_status: "enrolled",
-      enrolled_at: now,
-      model: model || "ArcFace"
-    });
-  } catch (err) {
-    console.error("enrollFace error:", err);
-    res.status(500).json({ error: "Internal server error during face enrollment." });
-  }
-};
-
-export const revokeFaceEnrollment = async (req, res) => {
-  try {
-    const { targetUserId, userId, reason = "Administrator revocation" } = req.body;
-    const resolvedTargetId = targetUserId || userId || req.user.id;
-    const isSelf = resolvedTargetId === req.user.id;
-    const role = (req.user?.role || "").toLowerCase();
-    const isSuperAdmin = role === "superadmin";
-    const isAdmin = role === "admin" || isSuperAdmin || role === "hr manager";
-
-    // Only self or authorized admin can revoke
-    if (!isSelf && !isAdmin) {
-      return res.status(403).json({ error: "Access denied. Cannot revoke biometric profile for another user." });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Face re-enrollment request not found." });
     }
 
-    let targetCompanyId = req.user.companyId;
-    if (!isSelf) {
-      const userCheck = await query("SELECT id, company_id FROM users WHERE id = $1", [resolvedTargetId]);
-      if (userCheck.rows.length === 0) {
-        return res.status(404).json({ error: "Target employee not found." });
-      }
-      if (!isSuperAdmin && userCheck.rows[0].company_id !== req.user.companyId) {
-        return res.status(403).json({ error: "Access denied. Target employee belongs to another organization." });
-      }
-      targetCompanyId = userCheck.rows[0].company_id || req.user.companyId;
-    }
-
+    const request = result.rows[0];
     await query(
       `UPDATE employee_face_profiles
-       SET enrollment_status = 'suspended',
-           face_embedding = NULL,
-           reenrollment_requested_at = CURRENT_TIMESTAMP,
-           reenrollment_reason = $1,
-           updated_at = CURRENT_TIMESTAMP
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || '{"selfEnrollmentAuthorized": true, "reenrollmentAuthorized": true, "reenrollmentApprovedAt": "' || NOW()::text || '", "reenrollmentApprovedBy": "' || $1 || '"}'::jsonb,
+           updated_at = NOW()
        WHERE user_id = $2 AND company_id = $3`,
-      [reason, resolvedTargetId, targetCompanyId]
+      [req.user.id, request.employee_id, request.company_id]
     );
+
+    await addNotification({
+      userId: request.employee_id,
+      title: "Face Re-enrollment Approved",
+      message: "Your administrator approved your face re-enrollment request. You can now capture a new reference template.",
+      type: "success",
+      link: "/face-enrollment"
+    });
 
     auditService.logAudit({
       userId: req.user.id,
-      action: "BIOMETRIC_ENROLLMENT_REVOKED",
+      action: "FACE_REENROLLMENT_APPROVED",
       resourceType: "biometrics",
-      resourceId: `${resolvedTargetId}_profile`,
-      details: { targetUserId: resolvedTargetId, reason },
+      resourceId: request.id,
+      details: { employeeId: request.employee_id, companyId: request.company_id },
       req
     });
 
-    res.json({ success: true, message: "Biometric template revoked successfully." });
+    res.json({ success: true, request });
   } catch (err) {
-    console.error("revokeFaceEnrollment error:", err);
-    res.status(500).json({ error: "Failed to revoke biometric template." });
+    console.error("approveFaceReenrollmentRequest error:", err);
+    res.status(500).json({ error: "Failed to approve face re-enrollment request." });
+  }
+};
+
+export const rejectFaceReenrollmentRequest = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rejectionReason } = req.body || {};
+    const role = (req.user?.role || "").toLowerCase();
+    const isSuperAdmin = role === "superadmin";
+    const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
+
+    if (!isAdmin && !isSuperAdmin) {
+      return res.status(403).json({ error: "Access denied. Admin role required." });
+    }
+
+    const result = await query(
+      `UPDATE face_reenrollment_requests
+       SET status = 'rejected',
+           reviewed_by = $1,
+           reviewed_at = NOW(),
+           rejection_reason = $2,
+           permission_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = $3 ${!isSuperAdmin ? "AND company_id = $4" : ""}
+       RETURNING *`,
+      !isSuperAdmin ? [req.user.id, rejectionReason || "Not provided", id, req.user.companyId] : [req.user.id, rejectionReason || "Not provided", id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Face re-enrollment request not found." });
+    }
+
+    const request = result.rows[0];
+    await query(
+      `UPDATE employee_face_profiles
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || '{"selfEnrollmentAuthorized": false, "reenrollmentAuthorized": false}'::jsonb,
+           updated_at = NOW()
+       WHERE user_id = $2 AND company_id = $3`,
+      [req.user.id, request.employee_id, request.company_id]
+    );
+
+    await addNotification({
+      userId: request.employee_id,
+      title: "Face Re-enrollment Rejected",
+      message: rejectionReason ? `Your re-enrollment request was rejected: ${rejectionReason}` : "Your face re-enrollment request was rejected by your administrator.",
+      type: "warning",
+      link: "/face-enrollment"
+    });
+
+    auditService.logAudit({
+      userId: req.user.id,
+      action: "FACE_REENROLLMENT_REJECTED",
+      resourceType: "biometrics",
+      resourceId: request.id,
+      details: { employeeId: request.employee_id, companyId: request.company_id, rejectionReason },
+      req
+    });
+
+    res.json({ success: true, request });
+  } catch (err) {
+    console.error("rejectFaceReenrollmentRequest error:", err);
+    res.status(500).json({ error: "Failed to reject face re-enrollment request." });
   }
 };
 
@@ -1617,4 +872,1130 @@ export const adminRevertPenalty = async (req, res) => {
     console.error("adminRevertPenalty error:", err);
     res.status(500).json({ error: "Failed to revert attendance penalty." });
   }
+};
+
+export const getFaceStatus = async (req, res) => {
+  try {
+    const targetUserId = req.query.userId || req.user.id;
+    const role = (req.user?.role || "").toLowerCase();
+    const isSuperAdmin = role === "superadmin";
+    const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
+
+    if (targetUserId !== req.user.id && !isAdmin && !isSuperAdmin) {
+      return res.status(403).json({ error: "Access denied. Cannot view biometrics for other employees." });
+    }
+
+    const companyId = req.user.companyId;
+    let sql = "SELECT * FROM employee_face_profiles WHERE user_id = $1";
+    const params = [targetUserId];
+
+    if (!isSuperAdmin && companyId) {
+      sql += " AND company_id = $2";
+      params.push(companyId);
+    }
+
+    const result = await query(sql, params);
+    if (result.rows.length === 0) {
+      return res.json({
+        user_id: targetUserId,
+        enrollment_status: "pending",
+        is_enrolled: false,
+        metadata: {}
+      });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      user_id: row.user_id,
+      company_id: row.company_id,
+      enrollment_status: row.enrollment_status,
+      is_enrolled: row.enrollment_status === "enrolled",
+      embedding_model: row.embedding_model,
+      enrolled_at: row.enrolled_at,
+      consent_recorded_at: row.consent_recorded_at,
+      metadata: row.metadata || {}
+    });
+  } catch (err) {
+    console.error("getFaceStatus error:", err);
+    res.status(500).json({ error: "Failed to fetch biometric enrollment status." });
+  }
+};
+
+export const authorizeFaceEnrollment = async (req, res) => {
+  try {
+    await ensureFaceReenrollmentTable();
+    const { targetUserId } = req.body;
+    if (!targetUserId) {
+      return res.status(400).json({ error: "targetUserId is required." });
+    }
+
+    const role = (req.user?.role || "").toLowerCase();
+    const isSuperAdmin = role === "superadmin";
+    const isAdmin = role === "admin" || role === "hr manager" || role === "system admin";
+
+    if (!isAdmin && !isSuperAdmin) {
+      return res.status(403).json({ error: "Only administrators and HR personnel can authorize face enrollment." });
+    }
+
+    const companyId = req.user.companyId;
+    const userCheck = await query("SELECT id, name, email, company_id FROM users WHERE id = $1", [targetUserId]);
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Target employee not found." });
+    }
+
+    const targetUser = userCheck.rows[0];
+    if (!isSuperAdmin && targetUser.company_id !== companyId) {
+      return res.status(403).json({ error: "Access denied. Target employee belongs to another organization." });
+    }
+
+    const profileId = `${targetUserId}_profile`;
+    const now = new Date().toISOString();
+
+    await query(
+      `INSERT INTO employee_face_profiles (id, user_id, company_id, enrollment_status, metadata, updated_at)
+       VALUES ($1, $2, $3, 'pending', $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (id) DO UPDATE SET
+         metadata = COALESCE(employee_face_profiles.metadata, '{}'::jsonb) || $4,
+         updated_at = CURRENT_TIMESTAMP`,
+      [
+        profileId,
+        targetUserId,
+        targetUser.company_id || companyId,
+        JSON.stringify({
+          selfEnrollmentAuthorized: true,
+          reenrollmentAuthorized: true,
+          authorizedAt: now,
+          authorizedBy: req.user.id
+        })
+      ]
+    );
+
+    const requestId = `face_reenroll_${crypto.randomUUID()}`;
+    await query(
+      `INSERT INTO face_reenrollment_requests (id, employee_id, company_id, reason, status, reviewed_by, reviewed_at, permission_expires_at, created_at, updated_at)
+       VALUES ($1, $2, $3, 'admin authorization', 'approved', $4, NOW(), NOW() + INTERVAL '${FACE_REENROLL_VALIDITY_HOURS} hours', NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         status = 'approved',
+         reviewed_by = EXCLUDED.reviewed_by,
+         reviewed_at = NOW(),
+         permission_expires_at = NOW() + INTERVAL '${FACE_REENROLL_VALIDITY_HOURS} hours',
+         updated_at = NOW()`,
+      [requestId, targetUserId, targetUser.company_id || companyId, req.user.id]
+    );
+
+    auditService.logAudit({
+      userId: req.user.id,
+      action: "BIOMETRIC_ENROLLMENT_AUTHORIZED",
+      resourceType: "biometrics",
+      resourceId: profileId,
+      details: { targetUserId, authorizedBy: req.user.id },
+      req
+    });
+
+    res.json({ success: true, message: "Face self-enrollment authorized successfully for employee.", targetUserId });
+  } catch (err) {
+    console.error("authorizeFaceEnrollment error:", err);
+    res.status(500).json({ error: "Failed to authorize face enrollment." });
+  }
+};
+
+export const enrollFace = async (req, res) => {
+  try {
+    const { imageBase64, consentGiven, biometricConsent, targetUserId, userId } = req.body;
+    const consent = consentGiven !== undefined ? consentGiven : (biometricConsent !== undefined ? biometricConsent : true);
+    const resolvedTargetId = targetUserId || userId || req.user.id;
+    const isSelf = resolvedTargetId === req.user.id;
+    const role = (req.user?.role || "").toLowerCase();
+    const isSuperAdmin = role === "superadmin";
+    const isAdmin = role === "admin" || isSuperAdmin || role === "hr manager";
+
+    if (!isSelf && !isAdmin) {
+      return res.status(403).json({ error: "Unauthorized: Cannot enroll face biometrics for another user." });
+    }
+
+    let targetCompanyId = req.user.companyId;
+
+    if (!isSelf) {
+      const userCheck = await query(
+        "SELECT id, name, email, company_id, status FROM users WHERE id = $1",
+        [resolvedTargetId]
+      );
+      if (userCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Target employee not found." });
+      }
+      const targetUser = userCheck.rows[0];
+      if (!isSuperAdmin && targetUser.company_id !== req.user.companyId) {
+        return res.status(403).json({
+          error: "Access denied. Target employee belongs to another organization.",
+          code: "CROSS_TENANT_ACCESS_DENIED"
+        });
+      }
+      targetCompanyId = targetUser.company_id || req.user.companyId;
+    }
+
+    const existingProfileCheck = await query(
+      "SELECT * FROM employee_face_profiles WHERE user_id = $1 AND company_id = $2",
+      [resolvedTargetId, targetCompanyId]
+    );
+    const existingProfile = existingProfileCheck.rows[0] || null;
+    const isAlreadyEnrolled = Boolean(
+      existingProfile &&
+      existingProfile.enrollment_status === "enrolled" &&
+      existingProfile.face_embedding
+    );
+
+    if (isSelf && !isAdmin) {
+      const isAuthorized = Boolean(existingProfile?.metadata?.selfEnrollmentAuthorized);
+
+      if (!isAuthorized) {
+        return res.status(403).json({
+          error: "Face self-enrollment has not been authorized by HR or an Administrator.",
+          code: "SELF_ENROLLMENT_NOT_AUTHORIZED"
+        });
+      }
+
+      if (isAlreadyEnrolled && !existingProfile?.metadata?.reenrollmentAuthorized) {
+        return res.status(403).json({
+          error: "Face template is already enrolled. Self-replacement is not permitted. Please contact your administrator.",
+          code: "SELF_ENROLLMENT_NOT_AUTHORIZED"
+        });
+      }
+    }
+
+    const validation = validateEnrollmentPayload({ imageBase64, consentGiven: consent });
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    let microserviceResult;
+    try {
+      microserviceResult = await faceServiceClient.enrollFace(imageBase64);
+    } catch (svcErr) {
+      auditService.logAudit({
+        userId: req.user.id,
+        action: isAlreadyEnrolled ? "BIOMETRIC_REPLACEMENT_FAILED" : "BIOMETRIC_ENROLLMENT_FAILED",
+        resourceType: "biometrics",
+        resourceId: existingProfile?.id || `${resolvedTargetId}_profile`,
+        details: {
+          reason: svcErr.message,
+          targetUserId: resolvedTargetId,
+          mode: isAlreadyEnrolled ? "replacement" : "enrollment"
+        },
+        status: "FAILURE",
+        severity: "WARNING",
+        req
+      });
+      return res.status(svcErr.status || 400).json({ error: svcErr.message });
+    }
+
+    const { embedding, model, embedding_dimension, quality_score, face_count } = microserviceResult;
+
+    if (!isValidEmbedding(embedding, 512)) {
+      return res.status(500).json({ error: "Biometric service generated an invalid face embedding vector." });
+    }
+
+    const now = new Date().toISOString();
+
+    if (isAlreadyEnrolled) {
+      const profileId = existingProfile.id;
+      const updatedMetadata = {
+        ...(existingProfile.metadata || {}),
+        qualityScore: quality_score,
+        faceCount: face_count,
+        lastReplacementAt: now,
+        replacedBy: req.user.id,
+        replacedByRole: req.user.role || (isAdmin ? "admin" : "employee"),
+        replacementCount: ((existingProfile.metadata && existingProfile.metadata.replacementCount) || 0) + 1,
+        previousEnrolledAt: existingProfile.enrolled_at,
+        reenrollmentAuthorized: false
+      };
+
+      await query(
+        `UPDATE employee_face_profiles
+         SET face_embedding = $1,
+             embedding_model = $2,
+             embedding_dimension = $3,
+             enrollment_status = 'enrolled',
+             enrolled_by = $4,
+             enrolled_at = CURRENT_TIMESTAMP,
+             metadata = $5,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $6`,
+        [
+          JSON.stringify(embedding),
+          model || "ArcFace",
+          embedding_dimension || 512,
+          req.user.id,
+          JSON.stringify(updatedMetadata),
+          profileId
+        ]
+      );
+
+      if (isSelf && !isAdmin) {
+        const approval = await query(
+          `SELECT *
+           FROM face_reenrollment_requests
+           WHERE employee_id = $1 AND company_id = $2 AND status = 'approved' AND permission_expires_at > NOW() AND used_at IS NULL
+           ORDER BY requested_at DESC
+           LIMIT 1`,
+          [resolvedTargetId, targetCompanyId]
+        );
+
+        if (approval.rows[0]) {
+          await query(
+            `UPDATE face_reenrollment_requests
+             SET used_at = NOW(),
+                 permission_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [approval.rows[0].id]
+          );
+        }
+      }
+
+      auditService.logAudit({
+        userId: req.user.id,
+        action: "BIOMETRIC_TEMPLATE_REPLACED",
+        resourceType: "biometrics",
+        resourceId: profileId,
+        details: {
+          targetUserId: resolvedTargetId,
+          replacedBy: req.user.id,
+          mode: "replacement",
+          model: model || "ArcFace",
+          qualityScore: quality_score
+        },
+        req
+      });
+
+      return res.json({
+        success: true,
+        mode: "replacement",
+        enrollment_status: "enrolled",
+        enrolled_at: now,
+        model: model || "ArcFace",
+        message: "Face reference template replaced and validated successfully."
+      });
+    }
+
+    const profileId = existingProfile?.id || `${resolvedTargetId}_profile`;
+    const newMetadata = {
+      ...(existingProfile?.metadata || {}),
+      qualityScore: quality_score,
+      faceCount: face_count,
+      enrolledByRole: req.user.role,
+      consentRecorded: true,
+      enrolledBy: req.user.id,
+      reenrollmentAuthorized: false
+    };
+
+    if (existingProfile) {
+      await query(
+        `UPDATE employee_face_profiles
+         SET face_embedding = $1,
+             embedding_model = $2,
+             embedding_dimension = $3,
+             enrollment_status = 'enrolled',
+             enrolled_by = $4,
+             enrolled_at = CURRENT_TIMESTAMP,
+             consent_recorded_at = COALESCE(consent_recorded_at, CURRENT_TIMESTAMP),
+             metadata = $5,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $6`,
+        [
+          JSON.stringify(embedding),
+          model || "ArcFace",
+          embedding_dimension || 512,
+          req.user.id,
+          JSON.stringify(newMetadata),
+          existingProfile.id
+        ]
+      );
+    } else {
+      await query(
+        `INSERT INTO employee_face_profiles (
+           id, user_id, company_id, enrollment_status, face_embedding,
+           embedding_model, embedding_dimension, enrolled_by, enrolled_at,
+           consent_recorded_at, metadata, updated_at
+         ) VALUES ($1, $2, $3, 'enrolled', $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           enrollment_status = 'enrolled',
+           face_embedding = EXCLUDED.face_embedding,
+           embedding_model = EXCLUDED.embedding_model,
+           embedding_dimension = EXCLUDED.embedding_dimension,
+           enrolled_by = EXCLUDED.enrolled_by,
+           enrolled_at = CURRENT_TIMESTAMP,
+           consent_recorded_at = COALESCE(employee_face_profiles.consent_recorded_at, CURRENT_TIMESTAMP),
+           metadata = COALESCE(employee_face_profiles.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          profileId,
+          resolvedTargetId,
+          targetCompanyId,
+          JSON.stringify(embedding),
+          model || "ArcFace",
+          embedding_dimension || 512,
+          req.user.id,
+          JSON.stringify(newMetadata)
+        ]
+      );
+    }
+
+    auditService.logAudit({
+      userId: req.user.id,
+      action: "BIOMETRIC_ENROLLMENT_SUCCESS",
+      resourceType: "biometrics",
+      resourceId: profileId,
+      details: {
+        targetUserId: resolvedTargetId,
+        enrolledBy: req.user.id,
+        mode: "enrollment",
+        model: model || "ArcFace"
+      },
+      req
+    });
+
+    return res.json({
+      success: true,
+      mode: "enrollment",
+      enrollment_status: "enrolled",
+      enrolled_at: now,
+      model: model || "ArcFace",
+      message: "Face reference template enrolled successfully."
+    });
+  } catch (err) {
+    console.error("enrollFace error:", err);
+    res.status(500).json({ error: "Internal server error during face enrollment." });
+  }
+};
+
+export const revokeFaceEnrollment = async (req, res) => {
+  try {
+    const { targetUserId, userId, reason = "Administrator revocation" } = req.body;
+    const resolvedTargetId = targetUserId || userId || req.user.id;
+    const isSelf = resolvedTargetId === req.user.id;
+    const role = (req.user?.role || "").toLowerCase();
+    const isSuperAdmin = role === "superadmin";
+    const isAdmin = role === "admin" || isSuperAdmin || role === "hr manager";
+
+    if (!isSelf && !isAdmin) {
+      return res.status(403).json({ error: "Access denied. Cannot revoke biometric profile for another user." });
+    }
+
+    let targetCompanyId = req.user.companyId;
+    if (!isSelf) {
+      const userCheck = await query("SELECT id, company_id FROM users WHERE id = $1", [resolvedTargetId]);
+      if (userCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Target employee not found." });
+      }
+      if (!isSuperAdmin && userCheck.rows[0].company_id !== req.user.companyId) {
+        return res.status(403).json({ error: "Access denied. Target employee belongs to another organization." });
+      }
+      targetCompanyId = userCheck.rows[0].company_id || req.user.companyId;
+    }
+
+    await query(
+      `UPDATE employee_face_profiles
+       SET enrollment_status = 'suspended',
+           face_embedding = NULL,
+           reenrollment_requested_at = CURRENT_TIMESTAMP,
+           reenrollment_reason = $1,
+           metadata = COALESCE(metadata, '{}'::jsonb) || '{"selfEnrollmentAuthorized": false, "reenrollmentAuthorized": false}'::jsonb,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = $2 AND company_id = $3`,
+      [reason, resolvedTargetId, targetCompanyId]
+    );
+
+    auditService.logAudit({
+      userId: req.user.id,
+      action: "BIOMETRIC_ENROLLMENT_REVOKED",
+      resourceType: "biometrics",
+      resourceId: `${resolvedTargetId}_profile`,
+      details: { targetUserId: resolvedTargetId, reason },
+      req
+    });
+
+    res.json({ success: true, message: "Biometric template revoked successfully." });
+  } catch (err) {
+    console.error("revokeFaceEnrollment error:", err);
+    res.status(500).json({ error: "Failed to revoke biometric template." });
+  }
+};
+
+const addNotification = async ({ userId, title, message, type = "info", link = "", req = null }) => {
+  if (!userId || !title || !message) return null;
+
+  const id = `notif_${crypto.randomUUID()}`;
+  const result = await query(
+    `INSERT INTO notifications (id, user_id, title, message, type, read, link)
+     VALUES ($1, $2, $3, $4, $5, FALSE, $6)
+     RETURNING *`,
+    [id, userId, title, message, type, link]
+  );
+
+  const notification = result.rows[0];
+  const io = req?.app?.get("io");
+  if (io) {
+    const formatted = {
+      id: notification.id,
+      _id: notification.id,
+      userId: notification.user_id,
+      title: notification.title,
+      message: notification.message,
+      type: notification.type,
+      read: notification.read,
+      link: notification.link,
+      createdAt: notification.created_at,
+      created_at: notification.created_at,
+      timestamp: notification.created_at
+    };
+    io.emit(`notification_${userId}`, formatted);
+  }
+
+  return notification;
+};
+
+export const getAttendance = async (req, res) => {
+  try {
+    const { userId, companyId, startDate, endDate, date } = req.query;
+    const isSuperAdmin = req.user?.role?.toLowerCase() === "superadmin";
+    const targetCompanyId = isSuperAdmin && companyId ? companyId : req.user?.companyId;
+
+    let sql = `
+      SELECT a.*, a.date::text as date_str, a.id as "_id", u.name as user_name, u.name as "userName",
+             u.email as user_email, u.department as "userDept", u.department
+      FROM attendance a
+      LEFT JOIN users u ON a.user_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (req.user && req.user.role === "employee") {
+      params.push(req.user.id);
+      sql += ` AND a.user_id = $${params.length}`;
+    } else if (userId) {
+      params.push(userId);
+      sql += ` AND a.user_id = $${params.length}`;
+    }
+
+    if (targetCompanyId) {
+      params.push(targetCompanyId);
+      sql += ` AND a.company_id = $${params.length}`;
+    }
+
+    if (date) {
+      params.push(date);
+      sql += ` AND a.date = $${params.length}`;
+    }
+
+    if (startDate && endDate) {
+      params.push(startDate);
+      sql += ` AND a.date >= $${params.length}`;
+      params.push(endDate);
+      sql += ` AND a.date <= $${params.length}`;
+    }
+
+    sql += " ORDER BY a.date DESC, a.check_in DESC LIMIT 1000";
+    const result = await query(sql, params);
+
+    const logs = result.rows.map(row => {
+      const checkInDate = row.check_in ? new Date(row.check_in) : null;
+      const checkOutDate = row.check_out ? new Date(row.check_out) : null;
+      const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
+
+      const durationHours = row.duration_minutes ? (row.duration_minutes / 60).toFixed(1) : (row.check_out ? "0.0" : "Live");
+      const dateStr = row.date_str || (row.date instanceof Date ? row.date.toISOString().split("T")[0] : (row.date ? String(row.date).split("T")[0] : ""));
+
+      let frontendStatus = "not-checked-in";
+      let currentBreakTimerEnd = null;
+      if (row.check_out) {
+        frontendStatus = "checked-out";
+      } else if (Array.isArray(row.breaks) && row.breaks.some(b => !b.end && !b.resumeTime)) {
+        frontendStatus = "on-break";
+        const activeB = row.breaks.find(b => !b.end && !b.resumeTime);
+        if (activeB) {
+          const bStart = new Date(activeB.start || activeB.startTime).getTime();
+          const bType = activeB.breakType || activeB.type || "short";
+          const durSec = bType === "bio" ? 900 : 1800;
+          currentBreakTimerEnd = new Date(bStart + durSec * 1000).toISOString();
+        }
+      } else if (row.check_in) {
+        frontendStatus = "checked-in";
+      }
+
+      return {
+        ...row,
+        id: row.id,
+        userId: row.user_id,
+        companyId: row.company_id,
+        date: dateStr,
+        checkIn: formatTime(checkInDate),
+        checkOut: formatTime(checkOutDate),
+        checkInTime: row.check_in || now,
+        checkOutTime: row.check_out || now,
+        checkInLocation: row.check_in_location || row.location,
+        checkOutLocation: row.check_out_location,
+        totalHours: durationHours,
+        status: frontendStatus,
+        currentBreakTimerEnd
+      };
+    });
+
+    res.json(logs);
+  } catch (err) {
+    console.error("getAttendance error:", err);
+    res.status(500).json({ error: "Failed to fetch attendance logs." });
+  }
+};
+
+export const checkIn = async (req, res) => {
+  try {
+    let userId = req.user?.id || req.body.userId;
+    if (typeof userId === "object" && userId !== null) {
+      userId = userId.uid || userId.id;
+    }
+    const companyId = req.user?.companyId || req.body.companyId || req.body.userId?.companyId;
+    const today = req.body.date || new Date().toISOString().split("T")[0];
+    const now = new Date().toISOString();
+    const { location, workMode = "office", verificationSessionToken } = req.body;
+
+    if (!verificationSessionToken) {
+      return res.status(400).json({
+        error: "Biometric verification is required. Please capture a selfie to check in."
+      });
+    }
+
+    const tokenHash = hashToken(verificationSessionToken);
+    const sessionRes = await query(
+      `UPDATE attendance_verification_sessions
+       SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE token_hash = $1
+         AND user_id = $2
+         AND company_id = $3
+         AND status = 'issued'
+         AND expires_at > CURRENT_TIMESTAMP
+       RETURNING *`,
+      [tokenHash, userId, companyId]
+    );
+
+    if (sessionRes.rows.length === 0) {
+      auditService.logAudit({
+        userId,
+        action: "ATTENDANCE_VERIFICATION_REPLAY_REJECTED",
+        resourceType: "attendance",
+        resourceId: `session_${tokenHash.slice(0, 10)}`,
+        details: { reason: "Invalid, expired, or already-consumed verification token", action: "check-in" },
+        req
+      });
+      return res.status(403).json({
+        error: "Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie."
+      });
+    }
+
+    const geoCheck = await validateServerGeofence({ companyId, location, user: req.user });
+    if (!geoCheck.allowed) {
+      return res.status(400).json({
+        error: geoCheck.reason || "Check-in denied: You are outside the permitted workplace area."
+      });
+    }
+
+    const recordId = `${userId}_${today}`;
+    const result = await query(
+      `INSERT INTO attendance (id, user_id, company_id, date, check_in, status, work_mode, check_in_location, location)
+       VALUES ($1, $2, $3, $4, $5, 'present', $6, $7, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         check_in = COALESCE(attendance.check_in, EXCLUDED.check_in),
+         check_out = NULL,
+         status = 'present',
+         check_in_location = EXCLUDED.check_in_location,
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [recordId, userId, companyId, today, now, workMode, JSON.stringify(location || {})]
+    );
+
+    const row = result.rows[0];
+    const checkInDate = row.check_in ? new Date(row.check_in) : new Date();
+    const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
+
+    auditService.logAudit({
+      userId,
+      action: "ATTENDANCE_CLOCK_IN",
+      resourceType: "attendance",
+      resourceId: row.id,
+      details: { date: today, workMode, location, verificationSessionId: sessionRes.rows[0].id },
+      req
+    });
+
+    res.json({
+      ...row,
+      id: row.id,
+      userId: row.user_id,
+      companyId: row.company_id,
+      date: today,
+      checkIn: formatTime(checkInDate),
+      checkInTime: row.check_in || now,
+      checkInLocation: row.check_in_location || row.location,
+      status: "checked-in"
+    });
+  } catch (err) {
+    console.error("checkIn error:", err);
+    res.status(500).json({ error: "Check-in failed." });
+  }
+};
+
+export const checkOut = async (req, res) => {
+  try {
+    let userId = req.user?.id || req.body.userId;
+    if (typeof userId === "object" && userId !== null) {
+      userId = userId.uid || userId.id;
+    }
+    const companyId = req.user?.companyId || req.body.companyId;
+    const today = req.body.date || new Date().toISOString().split("T")[0];
+    const now = new Date().toISOString();
+    const { location, verificationSessionToken } = req.body;
+
+    if (!verificationSessionToken) {
+      return res.status(400).json({
+        error: "Biometric verification is required. Please capture a selfie to check out."
+      });
+    }
+
+    const tokenHash = hashToken(verificationSessionToken);
+    const sessionRes = await query(
+      `UPDATE attendance_verification_sessions
+       SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE token_hash = $1
+         AND user_id = $2
+         AND company_id = $3
+         AND status = 'issued'
+         AND expires_at > CURRENT_TIMESTAMP
+       RETURNING *`,
+      [tokenHash, userId, companyId]
+    );
+
+    if (sessionRes.rows.length === 0) {
+      auditService.logAudit({
+        userId,
+        action: "ATTENDANCE_VERIFICATION_REPLAY_REJECTED",
+        resourceType: "attendance",
+        resourceId: `session_${tokenHash.slice(0, 10)}`,
+        details: { reason: "Invalid, expired, or already-consumed verification token", action: "check-out" },
+        req
+      });
+      return res.status(403).json({
+        error: "Biometric verification session is invalid, expired, or has already been used. Please capture a fresh selfie."
+      });
+    }
+
+    const recordId = `${userId}_${today}`;
+    const existing = await query("SELECT * FROM attendance WHERE id = $1", [recordId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "No check-in found for today." });
+    }
+
+    const rowData = existing.rows[0];
+    let durationMinutes = 0;
+    const breaks = Array.isArray(rowData.breaks) ? [...rowData.breaks] : [];
+    let totalBreakMinutes = 0;
+
+    breaks.forEach(b => {
+      if (b.start && b.end) {
+        totalBreakMinutes += Math.max(0, Math.floor((new Date(b.end) - new Date(b.start)) / 60000));
+      } else if (b.start && !b.end) {
+        b.end = now;
+        const dur = Math.max(0, Math.floor((new Date(now) - new Date(b.start)) / 60000));
+        b.durationMinutes = dur;
+        totalBreakMinutes += dur;
+      }
+    });
+
+    if (rowData.check_in) {
+      const checkInTime = new Date(rowData.check_in);
+      const rawElapsed = Math.max(0, Math.floor((new Date(now) - checkInTime) / 60000));
+      durationMinutes = Math.max(0, rawElapsed - totalBreakMinutes);
+    }
+
+    const checkoutStatus = durationMinutes < 240 ? "half-day" : "present";
+
+    const result = await query(
+      `UPDATE attendance
+       SET check_out = $1, check_out_location = $2, duration_minutes = $3, breaks = $4, status = $5, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6
+       RETURNING *`,
+      [now, JSON.stringify(location || {}), durationMinutes, JSON.stringify(breaks), checkoutStatus, recordId]
+    );
+
+    const row = result.rows[0];
+    const checkOutDate = row.check_out ? new Date(row.check_out) : new Date();
+    const formatTime = (d) => d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : "";
+
+    auditService.logAudit({
+      userId: row.user_id,
+      action: "ATTENDANCE_CLOCK_OUT",
+      resourceType: "attendance",
+      resourceId: row.id,
+      details: { date: today, totalWorkingMinutes: durationMinutes, verificationSessionId: sessionRes.rows[0].id },
+      req
+    });
+
+    res.json({
+      ...row,
+      id: row.id,
+      userId: row.user_id,
+      companyId: row.company_id,
+      date: today,
+      checkOut: formatTime(checkOutDate),
+      checkOutTime: row.check_out || now,
+      totalWorkingMinutes: durationMinutes,
+      status: "checked-out"
+    });
+  } catch (err) {
+    console.error("checkOut error:", err);
+    res.status(500).json({ error: "Check-out failed." });
+  }
+};
+
+export const startBreak = async (req, res) => {
+  try {
+    let userId = req.user?.id || req.body.userId;
+    if (typeof userId === "object" && userId !== null) {
+      userId = userId.uid || userId.id;
+    }
+    const today = req.body.date || new Date().toISOString().split("T")[0];
+    const now = new Date().toISOString();
+    const { breakType = "short", reason = "break", location } = req.body;
+
+    const recordId = `${userId}_${today}`;
+    const existing = await query("SELECT * FROM attendance WHERE id = $1", [recordId]);
+    if (existing.rows.length === 0 || !existing.rows[0].check_in) {
+      return res.status(400).json({ error: "Cannot start a break without checking in first." });
+    }
+    if (existing.rows[0].check_out) {
+      return res.status(400).json({ error: "Cannot start a break after checking out." });
+    }
+
+    const row = existing.rows[0];
+    const breaks = Array.isArray(row.breaks) ? [...row.breaks] : [];
+    if (breaks.some(b => !b.end && !b.resumeTime)) {
+      return res.status(400).json({ error: "A break is already in progress." });
+    }
+
+    if (breaks.length >= 3) {
+      return res.status(400).json({ error: "Maximum limit reached. An employee can only take up to 3 breaks per day." });
+    }
+
+    const normalizedReqType = String(breakType).toLowerCase();
+    const isTypeAlreadyUsed = breaks.some(b => {
+      const bType = String(b.breakType || b.type || "").toLowerCase();
+      const isResumed = Boolean(b.end || b.resumeTime);
+      if (!isResumed) return false;
+
+      if (normalizedReqType === "short" || normalizedReqType === "break1") {
+        return bType === "short" || bType === "break1";
+      }
+      if (normalizedReqType === "long" || normalizedReqType === "break2") {
+        return bType === "long" || bType === "break2";
+      }
+      if (normalizedReqType === "bio" || normalizedReqType === "break3") {
+        return bType === "bio" || bType === "break3";
+      }
+      return bType === normalizedReqType;
+    });
+
+    if (isTypeAlreadyUsed) {
+      return res.status(400).json({ error: "This break has already been taken and resumed today. It has been removed from your available breaks." });
+    }
+
+    let durationSeconds = 1800;
+    if (normalizedReqType === "bio" || normalizedReqType === "break3") durationSeconds = 900;
+    const timerEnd = new Date(Date.now() + durationSeconds * 1000).toISOString();
+
+    breaks.push({
+      start: now,
+      startTime: now,
+      end: null,
+      resumeTime: null,
+      breakType,
+      type: breakType,
+      reason,
+      location: location || null
+    });
+
+    const result = await query(
+      `UPDATE attendance
+       SET breaks = $1, status = 'on-break', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING *`,
+      [JSON.stringify(breaks), recordId]
+    );
+
+    const updated = result.rows[0];
+
+    auditService.logAudit({
+      userId,
+      action: "ATTENDANCE_BREAK_START",
+      resourceType: "attendance",
+      resourceId: recordId,
+      details: {
+        breakNumber: breaks.length,
+        breakType,
+        startTime: now,
+        durationMinutes: durationSeconds / 60,
+        remainingBreaksAfterThis: Math.max(0, 3 - breaks.length),
+        location: location || null
+      },
+      req
+    });
+
+    res.json({
+      ...updated,
+      id: updated.id,
+      userId: updated.user_id,
+      companyId: updated.company_id,
+      date: today,
+      checkInTime: updated.check_in,
+      checkOutTime: updated.check_out,
+      currentBreakTimerEnd: timerEnd,
+      status: "on-break",
+      breaks: updated.breaks
+    });
+  } catch (err) {
+    console.error("startBreak error:", err);
+    res.status(500).json({ error: "Failed to start break." });
+  }
+};
+
+export const endBreak = async (req, res) => {
+  try {
+    let userId = req.user?.id || req.body.userId;
+    if (typeof userId === "object" && userId !== null) {
+      userId = userId.uid || userId.id;
+    }
+    const today = req.body.date || new Date().toISOString().split("T")[0];
+    const now = new Date().toISOString();
+    const { location } = req.body;
+
+    const recordId = `${userId}_${today}`;
+    const existing = await query("SELECT * FROM attendance WHERE id = $1", [recordId]);
+    if (existing.rows.length === 0 || !existing.rows[0].check_in) {
+      return res.status(400).json({ error: "No attendance record found for today." });
+    }
+
+    const row = existing.rows[0];
+    const breaks = Array.isArray(row.breaks) ? [...row.breaks] : [];
+    const activeIdx = breaks.findIndex(b => !b.end && !b.resumeTime);
+    if (activeIdx === -1) {
+      return res.status(400).json({ error: "No active break to resume from." });
+    }
+
+    const breakStart = new Date(breaks[activeIdx].start || breaks[activeIdx].startTime);
+    const breakDurationMinutes = Math.max(0, Math.floor((new Date(now) - breakStart) / 60000));
+    breaks[activeIdx].end = now;
+    breaks[activeIdx].resumeTime = now;
+    breaks[activeIdx].durationMinutes = breakDurationMinutes;
+    breaks[activeIdx].duration = breakDurationMinutes;
+    if (location) breaks[activeIdx].endLocation = location;
+
+    const result = await query(
+      `UPDATE attendance
+       SET breaks = $1, status = 'present', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING *`,
+      [JSON.stringify(breaks), recordId]
+    );
+
+    const updated = result.rows[0];
+    const completedBreak = breaks[activeIdx];
+    const totalCompletedBreaks = breaks.filter(b => b.end || b.resumeTime).length;
+    auditService.logAudit({
+      userId: row.user_id,
+      action: "ATTENDANCE_BREAK_RESUME",
+      resourceType: "attendance",
+      resourceId: recordId,
+      details: {
+        breakNumber: activeIdx + 1,
+        breakType: completedBreak.breakType || completedBreak.type,
+        startTime: completedBreak.start || completedBreak.startTime,
+        resumeTime: now,
+        durationMinutes: breakDurationMinutes,
+        totalCompletedBreaks,
+        remainingBreaks: Math.max(0, 3 - totalCompletedBreaks),
+        location: location || null
+      },
+      req
+    });
+
+    res.json({
+      ...updated,
+      id: updated.id,
+      userId: updated.user_id,
+      companyId: updated.company_id,
+      date: today,
+      checkInTime: updated.check_in,
+      checkOutTime: updated.check_out,
+      status: "checked-in",
+      breaks: updated.breaks
+    });
+  } catch (err) {
+    console.error("endBreak error:", err);
+    res.status(500).json({ error: "Failed to end break." });
+  }
+};
+
+export const updateAttendance = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerRole = req.user?.role?.toLowerCase();
+    const isAllowed = callerRole === "admin" || callerRole === "superadmin" || callerRole === "manager" || callerRole === "system admin";
+
+    if (!isAllowed) {
+      return res.status(403).json({ error: "Access forbidden. Admin or Manager role required to edit attendance records." });
+    }
+
+    const { checkIn, checkOut, status, date } = req.body;
+
+    const result = await query(
+      `UPDATE attendance
+       SET check_in = COALESCE($1, check_in),
+           check_out = COALESCE($2, check_out),
+           status = COALESCE($3, status),
+           date = COALESCE($4, date),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $5
+       RETURNING *`,
+      [checkIn || null, checkOut || null, status || null, date || null, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Attendance record not found." });
+    }
+
+    const updatedRow = result.rows[0];
+    auditService.logAudit({
+      userId: req.user?.id,
+      action: "ATTENDANCE_EDIT",
+      resourceType: "attendance",
+      resourceId: id,
+      details: { checkIn, checkOut, status, date, targetUserId: updatedRow.user_id },
+      req
+    });
+    securityDetector.checkSuspiciousAction({
+      userId: req.user?.id,
+      action: "ATTENDANCE_EDIT",
+      resourceType: "attendance",
+      details: { checkIn, checkOut, status, date, targetUserId: updatedRow.user_id },
+      req
+    });
+
+    res.json(updatedRow);
+  } catch (err) {
+    console.error("updateAttendance error:", err);
+    res.status(500).json({ error: "Failed to update attendance." });
+  }
+};
+
+export const deleteAttendance = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerRole = req.user?.role?.toLowerCase();
+    const isAllowed = callerRole === "admin" || callerRole === "superadmin" || callerRole === "system admin";
+
+    if (!isAllowed) {
+      return res.status(403).json({ error: "Access forbidden. Admin role required to delete attendance records." });
+    }
+
+    const result = await query("DELETE FROM attendance WHERE id = $1 RETURNING id", [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Attendance record not found." });
+    }
+    res.json({ message: "Attendance record deleted.", id });
+  } catch (err) {
+    console.error("deleteAttendance error:", err);
+    res.status(500).json({ error: "Failed to delete attendance record." });
+  }
+};
+
+export const getAttendanceRules = async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    const targetCompanyId = companyId || req.user?.companyId;
+
+    if (targetCompanyId) {
+      const compResult = await query("SELECT value FROM settings WHERE key = $1", [`attendance_rules_${targetCompanyId}`]);
+      if (compResult.rows.length > 0) {
+        const val = compResult.rows[0].value;
+        return res.json({ rules: typeof val === "object" && val !== null ? (val.rules || "") : (val || "") });
+      }
+    }
+
+    const result = await query("SELECT value FROM settings WHERE key = 'attendance_rules'");
+    if (result.rows.length > 0) {
+      const val = result.rows[0].value;
+      res.json({ rules: typeof val === "object" && val !== null ? (val.rules || "") : (val || "") });
+    } else {
+      res.json({ rules: "" });
+    }
+  } catch (err) {
+    console.error("getAttendanceRules error:", err);
+    res.status(500).json({ error: "Failed to fetch attendance rules." });
+  }
+};
+
+export const updateAttendanceRules = async (req, res) => {
+  try {
+    const { rules, companyId } = req.body;
+    const targetCompanyId = companyId || req.user?.companyId;
+
+    if (targetCompanyId) {
+      await query(
+        `INSERT INTO settings (key, value)
+         VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+        [`attendance_rules_${targetCompanyId}`, JSON.stringify({ rules })]
+      );
+    }
+
+    await query(
+      `INSERT INTO settings (key, value)
+       VALUES ('attendance_rules', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [JSON.stringify({ rules })]
+    );
+
+    res.json({ success: true, rules });
+  } catch (err) {
+    console.error("updateAttendanceRules error:", err);
+    res.status(500).json({ error: "Failed to update attendance rules." });
+  }
+};
+
+const ensureFaceReenrollmentTable = async () => {
+  await query(`
+    CREATE TABLE IF NOT EXISTS face_reenrollment_requests (
+      id TEXT PRIMARY KEY,
+      employee_id TEXT NOT NULL,
+      company_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_by TEXT,
+      reviewed_at TIMESTAMPTZ,
+      rejection_reason TEXT,
+      permission_expires_at TIMESTAMPTZ,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_face_reenroll_employee_company
+    ON face_reenrollment_requests(employee_id, company_id, status, requested_at DESC);
+  `);
+
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_face_reenroll_company_status
+    ON face_reenrollment_requests(company_id, status, requested_at DESC);
+  `);
 };
